@@ -11,7 +11,7 @@
 # - 북마크: 끝까지 빠르게 스크롤 ↓, 위로 올라오며(JS 배치) 정밀 수집 ↑
 # - 멀티스레드 이미지 다운로드 + tqdm 진행바
 # - 로깅(터미널 + 파일 동시)
-# - 업 스크롤 시 dupURL=0이면 stepPx/4씩 4회 재수집 후 다음 스텝
+# - 업 스크롤 시 dupURL=0이면 로그를 남기고 stepPx/4씩 4회 재수집 후 다음 스텝
 
 import sys
 import os
@@ -100,12 +100,12 @@ DOWN_BUFFER_CHECKS = 6
 DOWN_BUFFER_SLEEP_S = 0.18
 DOWN_STALL_TOLERANCE = 3
 
-# stepPx를 크게 설정
-UP_STEP_PX = 900
+# stepPx 크게 (1200)
+UP_STEP_PX = 1200
 UP_DELAY_S = 0.04
 VIEWPORT_PAD = 300
 
-MAX_WORKERS = 8
+MAX_WORKERS = 10
 
 folder_base_name = "images"
 new_folder_path = folder_base_name
@@ -284,9 +284,6 @@ while True:
         print("message: reached the bottom (no more height growth).")
         break
 
-
-crawl_start_time = time.time()
-
 print("message: collecting while scrolling up in small steps...")
 UP_IDLE_CONFIRMS = 1
 UP_TOP_STALL_CONFIRMS = 3
@@ -326,6 +323,9 @@ def collect_upward_batch() -> Tuple[int, int, int]:
         added += 1
     return added, dups, len(batch)
 
+# 크롤링 시간 측정 시작
+crawl_start_time = time.time()
+
 step = 0
 top_stall_seq = 0
 while True:
@@ -349,8 +349,13 @@ while True:
             break
         time.sleep(max(UP_DELAY_S * 0.5, 0.02))
 
-    # dupURL=0이면 stepPx/4씩 4회 재수집
+    # dupURL=0이면 로그 남기고 재수집
     if local_dup == 0:
+        print(
+            f"debug: scrollstep={step} (zero-detect), newURL={local_new}, dupURL={local_dup}, "
+            f"batchSize={last_batch_size}, jsCalls={local_batch_calls}, "
+            f"yOffset={get_scrollY()}, totalSeen={len(seen_urls)}, stepPx={UP_STEP_PX}"
+        )
         quarter_step = int(UP_STEP_PX / 4)
         for _ in range(4):
             driver.execute_script("window.scrollBy(0, arguments[0]);", -quarter_step)
@@ -382,12 +387,15 @@ while True:
             f"totalSeen={len(seen_urls)}, stepPx={UP_STEP_PX}"
         )
         break
+
+# 크롤링 종료 시간
 crawl_end_time = time.time()
 elapsed = crawl_end_time - crawl_start_time
 print(f"message: URL crawling completed in {elapsed:.2f} seconds")
 
 print(f"message: Final total number of collected URLs: {len(image_data)}")
 print("message: Start downloading images...")
+
 
 def make_session() -> requests.Session:
     s = requests.Session()
