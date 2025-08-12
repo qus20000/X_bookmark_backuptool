@@ -6,28 +6,32 @@
 # -----------------------------------------------------------------------------
 # 본 스크립트는 X(트위터) 북마크 페이지에서 이미지 URL을 수집하고 이미지를 다운로드하는 도구입니다.
 #
-# 공통 동작(본 버전: IO 제외):
-# - 1) 완전 하강(북마크 페이지에서 스크롤 최하단까지 탐지). 하강 중에는 CDP(Network.*)만 사용하여
-#      pbs.twimg.com/media/... 요청을 수집 → Target 집합 구성
-# - 2) 바닥 도달 직후 near-bottom 프리로드 루프(±0.5*vh 왕복 + 짧은 대기/드레인)로 누락 최소화
-# - 3) 모드에 따라:
-#      - CDP_ONLY: 하강+프리로드 직후 바로 다운로드(업스크롤 없음). 메타는 비어 있을 수 있음.
-#      - SAFE    : 업스크롤하며 DOM 스냅샷(JS 실행)으로 메타를 채우고, 관측된 새 URL은 Target에 즉시 편입(Union)
+# 공통 동작:
+# - 1) 완전 하강(북마크 페이지에서 스크롤 최하단까지 탐지)"방식을 통해 모든 트윗이 로드된 상태를 확보 
+#   2) CDP(Network.* 성능 로그)에서 pbs.twimg.com/media/... 요청을 추출 → Target 집합 구성
+#   3) 모드에 따라:
+#      - CDP_ONLY: 하강 직후 바로 다운로드(업스크롤 없음). 하강 중 IO(IntersectionObserver)로
+#                  수집해둔 메타(업로더/시간)가 있으면 파일명에 반영, 없으면 MEDIA_KEY로 저장.
+#      - SAFE:    업스크롤 하며 DOM+IO로 Target을 하나씩 “확정”하고 메타를 최대한 채움.
+#                  확정되지 않은(Target - Current) 키는 “메타 없이”라도 URL로 저장.
 #
 # 로그 정책:
-#   - 하강 단계: 매 Burst 진행 상황 + CDP 누적/증가치 + viewport/scale/stepPxEff 로그
-#   - near-bottom: 왕복 루프 단계별 CDP 증가치
-#   - 업스크롤 단계: 단일 라인 포맷
-#     debug: [MODE=SAFE] scrollstep=..., newURL=..., dupURL=..., batchSize=..., jsCalls=..., yOffset=..., TargetTotalSeen=..., CurrentTotalSeen=..., UnionTotalSeen=...
-#   - 종료 요약: CDPOnly, Safe(Union) 최종 개수, 다운로드 통계
+#   - 하강 단계: 매 Burst 진행 상황과 CDP/IO 누적치 로그
+#   - 업스크롤 단계: 단일 라인 포맷만 출력
+#   - Save시 디버그타입 : debug: [MODE=SAFE] scrollstep=..., newURL=..., dupURL=..., batchSize=..., jsCalls=..., yOffset=..., TargetTotalSeen=..., CurrentTotalSeen=...
+#   - backup 종료시 TargetTotalSeen, CurrentTotalSeen, Missing 수를 출력하고,
+#                Missing 키/URL 상세를 log.txt에 기록(다운로드는 “키만”으로 진행)
 #
 # 파일명 정책(결정적):
-#   - "meta_if_available": 메타 있으면 uploader_time_key.ext, 없으면 key.ext (MEDIA_KEY 항상 포함)
-#   - "key_only":          항상 key.ext
+#   - 기본은 META_if_available 모드: 메타가 있으면 uploader_time_key.ext, 없으면 key.ext
+#   - 항상 MEDIA_KEY를 포함하여 재실행/병합 시에도 파일명이 결정적
+#   - 이미 같은 파일명이 있으면 스킵(SKIP_IF_EXISTS=True 권장)
 #
 # 배포/튜닝:
 #   - CONFIG 섹션만 수정해서 환경/성능 튜닝 가능
-#   - 본 버전은 IntersectionObserver(=IO) 경로를 제거했음(원복 포인트 주석 참조)
+#   - CDP_ONLY 변동성을 줄이기 위한 옵션을 제공:
+#     * 캐시 비활성화(CDP_DISABLE_CACHE), 북마크 진입 후 하드 리로드,
+#     * 하강 중 CDP drain 주기(Burst마다), 자동 SAFE 폴백(Threshold 미달 시)
 # -----------------------------------------------------------------------------
 
 import sys
@@ -53,43 +57,37 @@ CONFIG = {
     "PROFILE_DIR_NAME": "Default",
 
     # 하강(북마크 페이지에서 스크롤 최하단까지 탐지할 때 사용되는 파라미터입니다.)
-    "DOWN_SCROLL_BURST": 60,         # Burst당 스크롤 횟수
-    # NOTE: 본 버전은 DOWN_STEP_PX 대신 viewport 기반 DOWN_STEP_PX_EFF를 사용(아래 가변 로직)
-    "DOWN_STEP_PX": 1800,            # (원복 포인트) 고정 스텝을 쓰고 싶을 때 사용
-    "DOWN_DELAY_S": 0.02,            # 스크롤 호출 사이 대기
+    "DOWN_SCROLL_BURST": 40,         # Burst당 스크롤 횟수
+    
+    "DOWN_STEP_PX": 1100,            # 스크롤 1회 픽셀 (기본), 실제론 VH 기반 DOWN_STEP_PX_EFF가 사용됨.  VH 기반 클램프로 자동 조정됨.
+    "DOWN_DELAY_S": 0.035,            # 스크롤 호출 사이 대기
     "DOWN_BUFFER_CHECKS": 6,         # Burst 후 scrollHeight 증가 체크 횟수
     "DOWN_BUFFER_SLEEP_S": 0.18,     # 각 체크 간 대기
-    "DOWN_STALL_TOLERANCE": 3,       # scrollHeight 증가 정지 연속 허용 횟수
+    "DOWN_STALL_TOLERANCE": 5,       # scrollHeight 증가 정지 연속 허용 횟수
     "YOFFSET_STALL_BURSTS": 5,       # 연속 Burst 동안 yOffset 변화 없음 허용 횟수
     "YOFFSET_EPS": 8,                # yOffset 변화 유효성 오차(px)
-    "DESCENT_CDP_LOG_INTERVAL": 1,   # 하강 중 CDP drain/로그 주기(Burst 단위, 1=매 Burst)
-
-    # viewport 기반 하강 스텝 비율(가변 로직)
-    "DOWN_STEP_RATIO_MIN": 0.60,     # 0.6 * vh
-    "DOWN_STEP_RATIO_MAX": 0.90,     # 0.9 * vh
-    "DOWN_STEP_RATIO_DEFAULT": 0.80, # 기본 선택 비율(0.8 * vh) 
-
-    # near-bottom 프리로드 루프(바닥 감지 직후 왕복으로 미디어 요청 유도)
-    "NB_SWINGS": 3,                  # 위↔아래 왕복 횟수(증가 시 수 초 더 소요)
-    "NB_STEP_RATIO": 0.50,           # 한 번 이동 크기 = NB_STEP_RATIO * vh
-    "NB_WAIT_S": 0.08,               # 각 이동 후 대기(짧게, CDP 요청 발생 여유)
+    "DESCENT_CDP_LOG_INTERVAL": 1,   # 하강 중 CDP/IO drain 및 로그 주기(Burst 단위, 1=매 Burst)
 
     # CDP 안정화 옵션
     "CDP_DISABLE_CACHE": True,               # Network.setCacheDisabled(true)로 캐시 무효화
     "HARD_RELOAD_ON_BOOKMARKS": True,        # 북마크 진입 직후 Page.reload(ignoreCache=true)
+    "CDP_ONLY_AUTOFALLBACK": True,           # CDP_ONLY 타겟 수 낮으면 SAFE로 자동 폴백
+    "CDP_ONLY_MIN_KEYS": 500,                # 최소 허용 키 수(환경에 맞게 조정)
+    "CDP_ONLY_MIN_RATIO_OF_PEAK": 0.90,      # 하강 중 관측된 피크 대비 허용 최소 비율
 
-    # 모드 및 SAFE 보조 옵션
-    "UP_STEP_PX": 4000,              # 의도 스텝 상한(실제 stepPxEff는 뷰포트 기반으로 클램프)
+    # 업스크롤(SAFE 모드에서만 사용)
+    "UP_STEP_PX": 3500,              # 의도 스텝 상한(실제 stepPxEff는 뷰포트 기반으로 클램프)
     "UP_DELAY_S": 0.04,              # 배치 폴링/스크롤 settle 대기 최소단위
     "VIEWPORT_PAD": 300,             # 수집 패딩(px)
-    "SAFE_OVERLAP_RATIO": 0.30,      # 커버리지 대비 최소 겹침 비율(0.4~0.6 권장)
-    "SAFE_ALLOW_UNION_EXPAND": True, # 업스크롤 중 DOM에서 새 URL 발견 시 Target에 즉시 편입
+    "SAFE_OVERLAP_RATIO": 0.35,      # 커버리지 대비 최소 겹침 비율(0.4~0.6 권장)
 
     # 다운로드
     "MAX_WORKERS": 10,               # 이미지 병렬 다운로드 스레드 수
 
     # 파일명 정책(결정적 파일명 + 존재시 스킵)
-    "FILENAME_MODE": "meta_if_available",    # "meta_if_available" | "key_only"
+    # - "meta_if_available": 메타 있으면 uploader_time_key.ext, 없으면 key.ext
+    # - "key_only":          항상 key.ext
+    "FILENAME_MODE": "meta_if_available",
     "SKIP_IF_EXISTS": True,          # 같은 파일명 있으면 다운로드 스킵
 }
 
@@ -99,7 +97,7 @@ USER_DATA_DIR        = CONFIG["USER_DATA_DIR"]
 PROFILE_DIR_NAME     = CONFIG["PROFILE_DIR_NAME"]
 
 DOWN_SCROLL_BURST    = CONFIG["DOWN_SCROLL_BURST"]
-DOWN_STEP_PX         = CONFIG["DOWN_STEP_PX"]  # (고정 스텝 원복 포인트)
+DOWN_STEP_PX         = CONFIG["DOWN_STEP_PX"]
 DOWN_DELAY_S         = CONFIG["DOWN_DELAY_S"]
 DOWN_BUFFER_CHECKS   = CONFIG["DOWN_BUFFER_CHECKS"]
 DOWN_BUFFER_SLEEP_S  = CONFIG["DOWN_BUFFER_SLEEP_S"]
@@ -108,29 +106,24 @@ YOFFSET_STALL_BURSTS = CONFIG["YOFFSET_STALL_BURSTS"]
 YOFFSET_EPS          = CONFIG["YOFFSET_EPS"]
 DESCENT_CDP_LOG_INTERVAL = CONFIG["DESCENT_CDP_LOG_INTERVAL"]
 
-DOWN_STEP_RATIO_MIN  = CONFIG["DOWN_STEP_RATIO_MIN"]
-DOWN_STEP_RATIO_MAX  = CONFIG["DOWN_STEP_RATIO_MAX"]
-DOWN_STEP_RATIO_DEFAULT = CONFIG["DOWN_STEP_RATIO_DEFAULT"]
-
-NB_SWINGS            = CONFIG["NB_SWINGS"]
-NB_STEP_RATIO        = CONFIG["NB_STEP_RATIO"]
-NB_WAIT_S            = CONFIG["NB_WAIT_S"]
-
 CDP_DISABLE_CACHE          = CONFIG["CDP_DISABLE_CACHE"]
 HARD_RELOAD_ON_BOOKMARKS   = CONFIG["HARD_RELOAD_ON_BOOKMARKS"]
+CDP_ONLY_AUTOFALLBACK      = CONFIG["CDP_ONLY_AUTOFALLBACK"]
+CDP_ONLY_MIN_KEYS          = CONFIG["CDP_ONLY_MIN_KEYS"]
+CDP_ONLY_MIN_RATIO_OF_PEAK = CONFIG["CDP_ONLY_MIN_RATIO_OF_PEAK"]
 
 UP_STEP_PX           = CONFIG["UP_STEP_PX"]
 UP_DELAY_S           = CONFIG["UP_DELAY_S"]
 VIEWPORT_PAD         = CONFIG["VIEWPORT_PAD"]
 SAFE_OVERLAP_RATIO   = CONFIG["SAFE_OVERLAP_RATIO"]
-SAFE_ALLOW_UNION_EXPAND = CONFIG["SAFE_ALLOW_UNION_EXPAND"]
 
 MAX_WORKERS          = CONFIG["MAX_WORKERS"]
+
 FILENAME_MODE        = CONFIG["FILENAME_MODE"]
 SKIP_IF_EXISTS       = CONFIG["SKIP_IF_EXISTS"]
 
 # -----------------------------------------------------------------------------
-# Dependencies: pip auto-installer
+# Dependencies: pip auto-installer (최초 실행 시 필요한 패키지 자동 설치)
 # -----------------------------------------------------------------------------
 try:
     sys.stdout.reconfigure(encoding='utf-8')
@@ -185,7 +178,7 @@ ensure_packages(REQUIRED_PKGS)
 # Selenium / Chrome bootstrap 
 # -----------------------------------------------------------------------------
 import requests
-from PIL import Image  # 미사용 가능
+from PIL import Image # 미사용
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
@@ -343,8 +336,12 @@ sys.stdout = Logger(log_file_path)
 # -----------------------------------------------------------------------------
 print("\n============================================================")
 print("Select mode:")
-print("  1) CDP_ONLY : Fastest. After full descent + near-bottom preload, drain CDP media URLs and download.")
-print("  2) SAFE     : Recommended. After descent, upward scan with DOM snapshot; union-expand Target if enabled.")
+print("  1) CDP_ONLY : Fastest. After full descent, drain CDP media URLs and download immediately.")
+print("                No upward scan / No heavy DOM parse. During descent, a lightweight")
+print("                IntersectionObserver collects metadata opportunistically.")
+print("  2) SAFE     : Recommended. After full descent, fix CDP Target, then upward scan.")
+print("                Use DOM+IntersectionObserver to enrich metadata and match Target.")
+print("                Reports Target vs Current and logs Missing keys/urls.")
 print("============================================================")
 print("Press '1' or '2' to start...")
 
@@ -361,7 +358,28 @@ while True:
 print(f"message: selected mode = {mode}")
 
 # -----------------------------------------------------------------------------
-# JS DOM snapshot (SAFE에서만 사용 / IO 제외)
+# JS Collectors (IO/DOM) (IntersectionObserver 기반, CDP_ONLY/SAFE 모두에서 사용됨.)
+# CDP는 pbs.twimg.com/media/... 요청을 수집하고, IO는 IntersectionObserver로 DOM에서 이미지 URL을 수집합니다.
+# CDP는 이미지 URL을 빠르고 대량으로 잡아오지만, Uploader/UploadTime 메타가 없습니다.
+# IO는 DOM에서 메타를 수집하지만, IntersectionObserver로 스크롤 위치에 따라 필요한 부분만 수집합니다.
+# DOM은 트윗 카드 안에서 업로더 핸들(@username)과 업로드 시간을 추출할 수 있으며, 파일명에 사용되는 메타데이터를 수집하는 용도로 사용됩니다.
+# 이 두 가지 방법을 조합하여, CDP_ONLY 모드에서는 빠르게 URL을 수집하고, SAFE 모드에서는 DOM을 통해 메타데이터를 최대한 채워서 파일명을 결정합니다.
+# CDP Only 모드에서도 어느정도 메타데이터 수집이 가능하지만, 완전하지 않습니다. 신뢰성이 부족하므로, Safe 모드에서는 하강 후 천천히 스크롤을 상승시켜
+# DOM을 통해 메타데이터를 안정적으로 수집하고, Target과 Current를 비교하여 매칭되는 이미지는 파일명을 부여하고, 누락되는 데이터는 log.txt에 기록합니다.
+## 전역 버퍼/중복제거
+# window.__xBuf: 새로 관측된 항목을 모아두는 버퍼
+# window.__xSeen: URL 단위 중복 방지 세트\
+# __xDump(): 파이썬 쪽에서 드레인(꺼내고 비우기)
+
+## 메타 추출 로직(트윗 카드 단위)
+# __xExtractFromArticle(art):
+# <time datetime="...">에서 ISO 시각 추출(“.000Z” 트리밍)
+# span 텍스트 중 @ 포함(핸들) 발견 시 업로더 후보로 사용
+# img[src*="media"] 전부 순회, URL을 name=orig로 정규화 후 버퍼에 push
+
+## 관측 장치
+# IntersectionObserver: 뷰포트에 들어오는 ARTICLE마다 __xExtractFromArticle 호출 → 보이는 순간 수집
+# MutationObserver: 새로 추가되는 ARTICLE을 자동 관측 대상으로 등록 → 가상 스크롤로 DOM이 바뀌어도 추적
 # -----------------------------------------------------------------------------
 JS_COLLECT_SNIPPET = r"""
 const pad = arguments[0];
@@ -396,9 +414,97 @@ for (const art of articles) {
       src = src.replace(/name=[^&]+/, 'name=orig');
       results.push({url: src, uploader_name: uploader, upload_time: dt});
     }
-  } catch(e) {}
+  } catch(e) { }
 }
 return results;
+"""
+
+JS_OBSERVER_BOOTSTRAP = r"""
+try {
+  if (!window.__xInit) {
+    window.__xInit = true;
+    window.__xBuf = [];
+    window.__xSeen = new Set();
+
+    function __xPush(url, uploader, dt) {
+      if (!url) return;
+      url = url.replace(/name=[^&]+/, 'name=orig');
+      if (window.__xSeen.has(url)) return;
+      window.__xSeen.add(url);
+      window.__xBuf.push({url, uploader_name: uploader || '', upload_time: dt || ''});
+    }
+
+    function __xExtractFromArticle(art) {
+      try {
+        const timeEl = art.querySelector('time');
+        let dt = '';
+        if (timeEl && timeEl.getAttribute('datetime')) {
+          dt = timeEl.getAttribute('datetime');
+          if (dt.endsWith('.000Z')) dt = dt.slice(0, -5);
+        }
+        let uploader = '';
+        const spans = art.querySelectorAll('span');
+        for (const s of spans) {
+          if (s.textContent && s.textContent.includes('@')) { uploader = s.textContent; break; }
+        }
+        const imgs = art.querySelectorAll('img[src*="media"]');
+        for (const im of imgs) {
+          const src = im.getAttribute('src') || '';
+          if (src) __xPush(src, uploader, dt);
+        }
+      } catch (e) {}
+    }
+
+    function __xSeed() {
+      const arts = document.querySelectorAll('article');
+      for (const a of arts) __xExtractFromArticle(a);
+    }
+
+    const io = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting && entry.target) {
+          __xExtractFromArticle(entry.target);
+        }
+      }
+    }, {root: null, threshold: 0.01});
+
+    function __xObserveExisting() {
+      const arts = document.querySelectorAll('article');
+      for (const a of arts) io.observe(a);
+    }
+
+    const mo = new MutationObserver((list) => {
+      for (const m of list) {
+        for (const node of m.addedNodes || []) {
+          if (!(node instanceof Element)) continue;
+          if (node.tagName === 'ARTICLE') {
+            io.observe(node);
+            __xExtractFromArticle(node);
+          } else {
+            const arts = node.querySelectorAll ? node.querySelectorAll('article') : [];
+            for (const a of arts) {
+              io.observe(a);
+              __xExtractFromArticle(a);
+            }
+          }
+        }
+      }
+    });
+    mo.observe(document.body, {childList: true, subtree: true});
+
+    window.__xDump = function() {
+      const out = window.__xBuf.slice();
+      window.__xBuf.length = 0;
+      return out;
+    };
+
+    __xSeed();
+    __xObserveExisting();
+  }
+  return true;
+} catch(e) {
+  return false;
+}
 """
 
 # -----------------------------------------------------------------------------
@@ -468,11 +574,8 @@ def make_deterministic_filename(url: str, uploader_name: str, upload_time: str) 
 
     return f"{mk}{ext}"
 
-# -----------------------------------------------------------------------------
-# CDP drain helpers
-# -----------------------------------------------------------------------------
 def drain_cdp_media() -> List[str]:
-    # CDP 성능로그에서 media URL 추출(고유 URL, name=orig 정규화).
+    # CDP 성능로그에서 media URL 추출(고유 URL, name=orig 정규화). 
     urls: List[str] = []
     seen = set()
     try:
@@ -502,7 +605,7 @@ def drain_cdp_media() -> List[str]:
     return urls
 
 def update_cdp_seen_from_logs(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str]) -> int:
-    # CDP drain → 고유 미디어키 집합/URL 맵 갱신. 반환: 이번 호출에서 새로 추가된 key 개수
+# CDP drain → 고유 미디어키 집합/URL 맵 갱신. 반환: 이번 호출에서 새로 추가된 key 개수 
     new_urls = drain_cdp_media()
     added = 0
     for u in new_urls:
@@ -516,8 +619,51 @@ def update_cdp_seen_from_logs(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str,
             added += 1
     return added
 
+def flush_io_buffer() -> List[Dict[str, str]]:
+# IO 버퍼를 비우고 표준화된 dict 목록으로 반환. 
+    try:
+        arr = driver.execute_script("return (window.__xDump && window.__xDump()) || []") or []
+    except Exception:
+        arr = []
+    out = []
+    for it in arr:
+        try:
+            u = it.get("url") if isinstance(it, dict) else ""
+            if not u:
+                continue
+            out.append({
+                "url": canon_media_url(u),
+                "uploader_name": (it.get("uploader_name") or "") if isinstance(it, dict) else "",
+                "upload_time": (it.get("upload_time") or "") if isinstance(it, dict) else "",
+            })
+        except Exception:
+            continue
+    return out
+
+def merge_into_meta_map(meta_map: Dict[str, Dict[str, str]], items: List[Dict[str, str]]) -> int:
+     
+    # items(url,uploader_name,upload_time)를 meta_map(key->{meta})에 병합.
+    # 새 키가 추가된 개수를 반환. 기존 키에 비어있는 필드는 새 값으로 채움.
+     
+    new_keys = 0
+    for it in items:
+        mk = normalize_media_key(it.get("url", ""))
+        if not mk:
+            continue
+        prev = meta_map.get(mk)
+        if not prev:
+            meta_map[mk] = {"uploader_name": it.get("uploader_name", ""), "upload_time": it.get("upload_time", "")}
+            new_keys += 1
+        else:
+            # 빈 필드는 채움
+            if not prev.get("uploader_name") and it.get("uploader_name"):
+                prev["uploader_name"] = it.get("uploader_name", "")
+            if not prev.get("upload_time") and it.get("upload_time"):
+                prev["upload_time"] = it.get("upload_time", "")
+    return new_keys
+
 # -----------------------------------------------------------------------------
-# Descent: 완전 바닥 탐지 (+ CDP drain)
+# Descent: 완전 바닥 탐지 (+ 간헐 CDP/IO 수집/로그)
 # -----------------------------------------------------------------------------
 def _get_scroll_y() -> int:
     try:
@@ -533,36 +679,61 @@ def _get_scroll_h() -> int:
     except Exception:
         return 0
 
-def _get_vh_and_scale() -> Tuple[int, float]:
+# === MOD: 뷰포트 높이(vh) 조회 유틸과, 방향에 따라 한 번 흔드는(jiggle) 유틸 추가
+def _get_vh() -> int:
     try:
-        res = driver.execute_script("""
-            return {
-                vh: window.innerHeight || 900,
-                scale: (window.visualViewport && window.visualViewport.scale) ? window.visualViewport.scale : 1.0
-            };
-        """) or {}
-        vh = int(res.get("vh") or 900)
-        scale = float(res.get("scale") or 1.0)
-        return vh, scale
+        return int(driver.execute_script("return window.innerHeight || 900") or 900)
     except Exception:
-        return 900, 1.0
+        return 900
 
-def full_descent_and_preload(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str]) -> Tuple[int, int, int, int]:
-    """
-    끝까지 하강 + near-bottom 프리로드 루프 수행.
-    반환: (cdp_peak, vh, step_eff, total_added_in_nb)
-    """
+def _jiggle_once(delta_px: int, wait_s: float = 0.08):
+    try:
+        cur_y = _get_scroll_y()
+        max_h = _get_scroll_h()
+        # top 근처면 down→up, 그 외(대개 bottom)면 up→down
+        if cur_y <= 32:
+            driver.execute_script("window.scrollBy(0, arguments[0]);",  int(delta_px))
+            time.sleep(wait_s)
+            driver.execute_script("window.scrollBy(0, arguments[0]);", -int(delta_px))
+        else:
+            driver.execute_script("window.scrollBy(0, arguments[0]);", -int(delta_px))
+            time.sleep(wait_s)
+            driver.execute_script("window.scrollBy(0, arguments[0]);",  int(delta_px))
+        time.sleep(max(0.04, wait_s * 0.5))
+    except Exception:
+        pass
+
+def bootstrap_observers():
+    # IO/MutationObserver를 페이지에 주입(하강/SAFE 모두에서 사용). 
+    try:
+        ok = driver.execute_script(JS_OBSERVER_BOOTSTRAP)
+        print(f"message: observer bootstrap: {'ok' if ok else 'failed'}")
+    except Exception as e:
+        print(f"message: observer bootstrap error: {e}")
+
+# === MOD: 하강 시작 전(top jiggle) 1회 수행
+def pre_descent_jiggle(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str]) -> None:
+    vh = _get_vh()
+    delta = max(80, int(0.45 * vh))
+    _jiggle_once(delta, 0.08)
+    added = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
+    print(f"message: top-jiggle done (vh={vh}, delta={delta}, cdpNew={added})")
+
+def full_descent(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str],
+                 desc_meta_by_key: Dict[str, Dict[str, str]]) -> int:
+     
+    # 끝까지 하강. Burst마다 진행 로그 출력, DESCENT_CDP_LOG_INTERVAL마다 CDP/IO drain.
+    # 반환: 하강 구간에서 관측한 cdpKeys 피크값(peak)
+     
     time.sleep(2)
     print("message: full-descent mode start...")
 
-    vh, scale = _get_vh_and_scale()
-    # viewport 기반 DOWN_STEP_PX_EFF 계산 (기본 0.8*vh, [0.6, 0.9] 범위로 클램프)
-    ratio = DOWN_STEP_RATIO_DEFAULT
-    ratio = max(DOWN_STEP_RATIO_MIN, min(ratio, DOWN_STEP_RATIO_MAX))
-    DOWN_STEP_PX_EFF = max(200, int(ratio * vh))  # (원복 포인트) 고정값 쓰려면 DOWN_STEP_PX 사용
-
-    print(f"debug: viewportInnerHeight={vh}, scale={scale:.3f}, DOWN_STEP_PX_EFF={DOWN_STEP_PX_EFF}, "
-          f"ratio={ratio:.2f}, burst={DOWN_SCROLL_BURST}")
+    # === MOD: VH 기반 하강 스텝 자동 클램프(줌-가드)
+    vh = _get_vh()
+    down_step_px_eff = max(200, min(DOWN_STEP_PX, int(0.70 * vh)))  # 70% vh 상한
+    zoom_guard = "on" if down_step_px_eff != DOWN_STEP_PX else "off"
+    ratio = (down_step_px_eff / max(1, vh))
+    print(f"debug: viewportInnerHeight={vh}, downStepPx={DOWN_STEP_PX}, stepEff={down_step_px_eff}, ratioUsed={ratio:.2f}, zoomGuard={zoom_guard}, burst={DOWN_SCROLL_BURST}")
 
     prev_h = _get_scroll_h()
     stall_cycles = 0
@@ -575,12 +746,10 @@ def full_descent_and_preload(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, 
     while True:
         burst_idx += 1
 
-        # 빠른 하강: 버스트로 여러 번 내리기
         for _ in range(DOWN_SCROLL_BURST):
-            driver.execute_script("window.scrollBy(0, arguments[0]);", DOWN_STEP_PX_EFF)
+            driver.execute_script("window.scrollBy(0, arguments[0]);", down_step_px_eff)
             time.sleep(DOWN_DELAY_S)
 
-        # scrollHeight 증가 감시
         grew = False
         grew_px = 0
         for _ in range(DOWN_BUFFER_CHECKS):
@@ -592,7 +761,6 @@ def full_descent_and_preload(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, 
                 prev_h = cur_h
                 break
 
-        # yOffset 정지 감시
         cur_y = _get_scroll_y()
         delta_y = cur_y - last_y
         if abs(delta_y) <= YOFFSET_EPS:
@@ -603,7 +771,7 @@ def full_descent_and_preload(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, 
 
         # 한번 더 찔러보기
         if not grew:
-            driver.execute_script("window.scrollBy(0, arguments[0]);", DOWN_STEP_PX_EFF)
+            driver.execute_script("window.scrollBy(0, arguments[0]);", down_step_px_eff)
             time.sleep(DOWN_DELAY_S)
             cur_h2 = _get_scroll_h()
             if cur_h2 > prev_h:
@@ -613,16 +781,19 @@ def full_descent_and_preload(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, 
 
         stall_cycles = 0 if grew else (stall_cycles + 1)
 
-        # 주기적 CDP drain
-        cdpNew = 0
+        # 주기적 CDP/IO drain
+        ioNew = 0
+        new_added = 0
         if (burst_idx % DESCENT_CDP_LOG_INTERVAL) == 0:
-            cdpNew = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
+            new_added = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
             cdp_peak = max(cdp_peak, len(cdp_seen_keys))
+            io_items = flush_io_buffer()
+            ioNew = merge_into_meta_map(desc_meta_by_key, io_items)
             print(
                 f"debug: downBurst={burst_idx}, perBurstScrolls={DOWN_SCROLL_BURST}, "
                 f"yOffset={cur_y}, deltaY={delta_y}, scrollHeight={prev_h}, grewPx={grew_px}, grew={int(grew)}, "
                 f"heightStallSeq={stall_cycles}/{DOWN_STALL_TOLERANCE}, yStallSeq={y_stall_seq}/{YOFFSET_STALL_BURSTS}, "
-                f"cdpKeys={len(cdp_seen_keys)}, cdpNew={cdpNew}"
+                f"cdpKeys={len(cdp_seen_keys)}, cdpNew={new_added}, ioKeys={len(desc_meta_by_key)}, ioNew={ioNew}"
             )
         else:
             print(
@@ -631,75 +802,73 @@ def full_descent_and_preload(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, 
                 f"heightStallSeq={stall_cycles}/{DOWN_STALL_TOLERANCE}, yStallSeq={y_stall_seq}/{YOFFSET_STALL_BURSTS}"
             )
 
-        if stall_cycles >= DOWN_STALL_TOLERANCE or y_stall_seq >= YOFFSET_STALL_BURSTS:
-            stop_reason = ("height-stall" if stall_cycles >= DOWN_STALL_TOLERANCE else "yoffset-stall")
+        if stall_cycles >= DOWN_STALL_TOLERANCE:
+            stop_reason = f"height-stall x{stall_cycles}"
+            break
+        if y_stall_seq >= YOFFSET_STALL_BURSTS:
+            stop_reason = f"yoffset-stall x{y_stall_seq}"
             break
 
-    # 최종 drain(마지막 남은 이벤트 수거)
+    # 최종 drain(마지막 남은 이벤트/버퍼 수거)
     _ = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
+    io_items = flush_io_buffer()
+    _ = merge_into_meta_map(desc_meta_by_key, io_items)
 
-    # near-bottom 프리로드 루프(±0.5*vh 왕복)
-    nb_step = max(50, int(NB_STEP_RATIO * vh))
-    total_added_nb = 0
-    base_y = _get_scroll_y()
-    print(f"message: near-bottom preload start: swings={NB_SWINGS}, nb_step={nb_step}, wait={NB_WAIT_S}s")
-
-    for swing in range(1, NB_SWINGS + 1):
-        # 위로 약간
-        driver.execute_script("window.scrollBy(0, arguments[0]);", -nb_step)
-        time.sleep(NB_WAIT_S)
-        a1 = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
-        total_added_nb += a1
-        print(f"debug: near-bottom swing#{swing} up, yOffset={_get_scroll_y()}, cdpNew={a1}, cdpKeys={len(cdp_seen_keys)}")
-
-        # 아래로 약간
-        driver.execute_script("window.scrollBy(0, arguments[0]);", nb_step)
-        time.sleep(NB_WAIT_S)
-        a2 = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
-        total_added_nb += a2
-        print(f"debug: near-bottom swing#{swing} down, yOffset={_get_scroll_y()}, cdpNew={a2}, cdpKeys={len(cdp_seen_keys)}")
-
-    # 최종적으로 바닥으로 위치 고정
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    time.sleep(max(0.05, NB_WAIT_S / 2))
-    _ = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
-
-    print(f"message: full-descent finished. stopReason={stop_reason}, yOffset={_get_scroll_y()}, scrollHeight={_get_scroll_h()}, "
-          f"cdpKeys={len(cdp_seen_keys)}, vh={vh}, stepEff={DOWN_STEP_PX_EFF}, nbAdded={total_added_nb}")
-    return cdp_peak, vh, DOWN_STEP_PX_EFF, total_added_nb
+    print(f"message: full-descent finished. stopReason={stop_reason}, yOffset={_get_scroll_y()}, scrollHeight={_get_scroll_h()}, cdpKeys={len(cdp_seen_keys)}, ioKeys={len(desc_meta_by_key)}")
+    return cdp_peak
 
 # -----------------------------------------------------------------------------
-# SAFE: 업스크롤 수집(Union 확장 및 메타 확보; IO 제외, DOM 스냅샷만)
+# SAFE: 업스크롤 수집(타겟 매칭 및 메타 확보)
 # -----------------------------------------------------------------------------
-def _dom_snapshot_collect(pad: int) -> Tuple[List[Dict[str, str]], int]:
-    """DOM 스냅샷 1회 호출. (items, jsCalls=1)"""
-    try:
-        dom_raw = driver.execute_script(JS_COLLECT_SNIPPET, pad) or []
-    except Exception:
-        dom_raw = []
-    items: List[Dict[str, str]] = []
+def _poll_once_and_confirm(target_keys: set[str], confirmed_keys: set[str], confirmed: Dict[str, Dict[str, str]]) -> Tuple[int,int,int,int]:
+    # IO 버퍼+DOM 스냅샷을 병합하여 Target에 해당하는 키를 확정. 
+    jsCalls = 0
+
+    io_items = flush_io_buffer()
+    jsCalls += 1
+
+    dom_raw = driver.execute_script(JS_COLLECT_SNIPPET, VIEWPORT_PAD) or []
+    jsCalls += 1
+    dom_items = []
     for d in dom_raw:
         try:
             url = canon_media_url(d.get("url") or "")
-            items.append({
+            dom_items.append({
                 "url": url,
                 "uploader_name": d.get("uploader_name") or "",
                 "upload_time": d.get("upload_time") or "",
             })
         except Exception:
             continue
-    return items, 1
 
-def _poll_until_settled_union(target_keys: set[str],
-                              union_keys: set[str],
-                              union_url_by_key: Dict[str, str],
-                              meta_map: Dict[str, Dict[str, str]]) -> Tuple[int,int,int,int]:
-    """
-    DOM 스냅샷을 짧게 여러 번 호출하여 안정화.
-    - target_keys: 초기 CDP 타깃(집계용)
-    - union_keys, union_url_by_key, meta_map: DOM에서 발견되면 즉시 편입/갱신
-    반환: (new_total, dup_total, last_batch_size, js_calls)
-    """
+    merged: Dict[str, Dict[str, str]] = {}
+    for src in (io_items, dom_items):
+        for it in src:
+            u = it["url"]
+            if u not in merged:
+                merged[u] = it
+
+    new_cnt = 0
+    dup_cnt = 0
+    for u, it in merged.items():
+        mk = normalize_media_key(u)
+        if not mk:
+            continue
+        if mk in target_keys:
+            if mk not in confirmed_keys:
+                confirmed_keys.add(mk)
+                confirmed[mk] = {
+                    "url": u,
+                    "uploader_name": it.get("uploader_name", ""),
+                    "upload_time": it.get("upload_time", ""),
+                }
+                new_cnt += 1
+            else:
+                dup_cnt += 1
+    return new_cnt, dup_cnt, len(merged), jsCalls
+
+def _poll_until_settled(target_keys: set[str], confirmed_keys: set[str], confirmed: Dict[str, Dict[str, str]]) -> Tuple[int,int,int,int]:
+    # 단계 내에서 수집이 안정될 때까지 짧게 폴링. 
     STEP_MIN_SETTLE_S = 0.30
     idle_seq = 0
     t0 = time.time()
@@ -709,44 +878,13 @@ def _poll_until_settled_union(target_keys: set[str],
     js_calls = 0
 
     while True:
-        items, jc = _dom_snapshot_collect(VIEWPORT_PAD)
-        js_calls += jc
-        last_batch_size = len(items)
+        a, d, b, c = _poll_once_and_confirm(target_keys, confirmed_keys, confirmed)
+        new_total += a
+        dup_total += d
+        last_batch_size = b
+        js_calls += c
 
-        # 병합/집계
-        step_new = 0
-        step_dup = 0
-        for it in items:
-            url = it["url"]
-            mk = normalize_media_key(url)
-            if not mk:
-                continue
-            # union 확장
-            existed = (mk in union_keys)
-            if not existed and SAFE_ALLOW_UNION_EXPAND:
-                union_keys.add(mk)
-                union_url_by_key[mk] = url
-                meta_map.setdefault(mk, {"uploader_name": "", "upload_time": ""})
-                # 메타 갱신
-                if it.get("uploader_name"):
-                    meta_map[mk]["uploader_name"] = it["uploader_name"]
-                if it.get("upload_time"):
-                    meta_map[mk]["upload_time"] = it["upload_time"]
-                step_new += 1
-            else:
-                # 이미 있던 키라도 메타가 비어있으면 채움
-                if mk in union_keys:
-                    meta_map.setdefault(mk, {"uploader_name": "", "upload_time": ""})
-                    if it.get("uploader_name") and not meta_map[mk].get("uploader_name"):
-                        meta_map[mk]["uploader_name"] = it["uploader_name"]
-                    if it.get("upload_time") and not meta_map[mk].get("upload_time"):
-                        meta_map[mk]["upload_time"] = it["upload_time"]
-                    step_dup += 1
-
-        new_total += step_new
-        dup_total += step_dup
-
-        if step_new == 0:
+        if a == 0:
             idle_seq += 1
         else:
             idle_seq = 0
@@ -757,23 +895,22 @@ def _poll_until_settled_union(target_keys: set[str],
 
     return new_total, dup_total, last_batch_size, js_calls
 
-def safe_upward_collect_union(initial_target_keys: set[str],
-                              target_url_by_key: Dict[str, str]) -> Tuple[Dict[str, Dict[str, str]], set[str], List[str], Dict[str, str], set[str]]:
-    """
-    SAFE 업스크롤(Union 확장). 반환:
-      - meta_map: 키 -> {url,uploader_name,upload_time}
-      - confirmed_keys: 업스크롤 동안 DOM에서 실제 관측된 키 집합
-      - missing_keys_against_initial: 초기 CDP 타깃 대비 미싱 키
-      - union_url_by_key: 최종 Union의 url 맵
-      - union_keys: 최종 Union 키 집합
-    """
-    # 초기 집합 준비
-    union_keys: set[str] = set(initial_target_keys)  # 시작은 CDP 타깃
-    union_url_by_key: Dict[str, str] = dict(target_url_by_key)  # CDP url
-    meta_map: Dict[str, Dict[str, str]] = {}  # 키별 메타(업로더/시간)
+# === MOD: SAFE 상승 전(bottom 근처) jiggle 1회 수행
+def pre_upward_jiggle(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str]) -> None:
+    vh = _get_vh()
+    delta = max(80, int(0.45 * vh))
+    _jiggle_once(delta, 0.08)
+    added = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
+    print(f"message: pre-upward jiggle done (vh={vh}, delta={delta}, cdpNew={added})")
+
+def safe_upward_collect(target_keys: set[str], target_url_by_key: Dict[str, str]) -> Tuple[Dict[str, Dict[str, str]], set[str], List[str]]:
+    # SAFE 업스크롤 수집. 반환: (확정맵, 확정키집합, Missing 키 List) 
+    confirmed: Dict[str, Dict[str, str]] = {}
     confirmed_keys: set[str] = set()
 
-    # 스텝/커버리지 계산
+    # === MOD: 상승 시작 직전에 jiggle 1회로 바닥 부근 로딩 유도
+    pre_upward_jiggle(cdp_seen_keys, cdp_url_by_key)
+
     try:
         vh = driver.execute_script("return window.innerHeight") or 900
     except Exception:
@@ -786,7 +923,7 @@ def safe_upward_collect_union(initial_target_keys: set[str],
     max_move_by_ratio = int(coverage * (1.0 - SAFE_OVERLAP_RATIO))
     move_px = min(move_px0, max_move_by_ratio)
 
-    TargetTotalSeen = len(initial_target_keys)
+    TargetTotalSeen = len(target_keys)
 
     step = 0
     top_stall_seq = 0
@@ -797,17 +934,12 @@ def safe_upward_collect_union(initial_target_keys: set[str],
         curr_y = _get_scroll_y()
 
         if curr_y <= 2:
-            a, d, b, js_calls = _poll_until_settled_union(initial_target_keys, union_keys, union_url_by_key, meta_map)
-            print(f"debug: [MODE=SAFE] scrollstep={step}(final), newURL={a}, dupURL={d}, batchSize={b}, jsCalls={js_calls}, yOffset={_get_scroll_y()}, "
-                  f"TargetTotalSeen={TargetTotalSeen}, CurrentTotalSeen={len(confirmed_keys)}, UnionTotalSeen={len(union_keys)}")
+            a, d, b, js_calls = _poll_once_and_confirm(target_keys, confirmed_keys, confirmed)
+            print(f"debug: [MODE=SAFE] scrollstep={step}(final), newURL={a}, dupURL={d}, batchSize={b}, jsCalls={js_calls}, yOffset={_get_scroll_y()}, TargetTotalSeen={TargetTotalSeen}, CurrentTotalSeen={len(confirmed_keys)}")
             break
 
-        # 현재 뷰포트에서 스냅샷 → union 확장/메타 채우기
-        new_total, dup_total, last_batch_size, total_js_calls = _poll_until_settled_union(initial_target_keys, union_keys, union_url_by_key, meta_map)
-        # DOM에서 관측된 것 중 이번 스텝에서 새로 들어온 키를 confirmed로 간주(간단화)
-        confirmed_keys.update(union_keys)  # 보수적: union으로 추가된 키를 관측된 것으로 처리
-        print(f"debug: [MODE=SAFE] scrollstep={step}, newURL={new_total}, dupURL={dup_total}, batchSize={last_batch_size}, jsCalls={total_js_calls}, "
-              f"yOffset={curr_y}, TargetTotalSeen={TargetTotalSeen}, CurrentTotalSeen={len(confirmed_keys)}, UnionTotalSeen={len(union_keys)}")
+        new_total, dup_total, last_batch_size, total_js_calls = _poll_until_settled(target_keys, confirmed_keys, confirmed)
+        print(f"debug: [MODE=SAFE] scrollstep={step}, newURL={new_total}, dupURL={dup_total}, batchSize={last_batch_size}, jsCalls={total_js_calls}, yOffset={curr_y}, TargetTotalSeen={TargetTotalSeen}, CurrentTotalSeen={len(confirmed_keys)}")
 
         prev_y = _get_scroll_y()
         driver.execute_script("window.scrollBy(0, arguments[0]);", -int(move_px))
@@ -820,26 +952,21 @@ def safe_upward_collect_union(initial_target_keys: set[str],
             top_stall_seq = 0
 
         if cur_y <= 2 and top_stall_seq >= 3:
-            a, d, b, js_calls = _poll_until_settled_union(initial_target_keys, union_keys, union_url_by_key, meta_map)
-            print(f"debug: [MODE=SAFE] scrollstep={step}(final), newURL={a}, dupURL={d}, batchSize={b}, jsCalls={js_calls}, yOffset={_get_scroll_y()}, "
-                  f"TargetTotalSeen={TargetTotalSeen}, CurrentTotalSeen={len(confirmed_keys)}, UnionTotalSeen={len(union_keys)}")
+            a, d, b, js_calls = _poll_once_and_confirm(target_keys, confirmed_keys, confirmed)
+            print(f"debug: [MODE=SAFE] scrollstep={step}(final), newURL={a}, dupURL={d}, batchSize={b}, jsCalls={js_calls}, yOffset={_get_scroll_y()}, TargetTotalSeen={TargetTotalSeen}, CurrentTotalSeen={len(confirmed_keys)}")
             break
 
     elapsed = time.time() - crawl_t0
-    missing_keys = [k for k in initial_target_keys if k not in union_keys]  # 초기 CDP 기준의 미싱(Union이 더 크면 0)
+    CurrentTotalSeen = len(confirmed_keys)
+    missing_keys = [k for k in target_keys if k not in confirmed_keys]
     print(f"message: SAFE upward collection finished in {elapsed:.2f} seconds")
-    print(f"message: TargetTotalSeen(initial CDP)={TargetTotalSeen}, UnionTotalSeen(final)={len(union_keys)}, MissingAgainstInitial={len(missing_keys)}")
+    print(f"message: TargetTotalSeen={TargetTotalSeen}, CurrentTotalSeen={CurrentTotalSeen}, Missing={TargetTotalSeen - CurrentTotalSeen}")
+    if missing_keys:
+        print("message: Missing detail follows (key -> url):")
+        for k in missing_keys:
+            print(f"message: MISSING key={k} url={target_url_by_key.get(k, '')}")
 
-    # meta_map에 url도 채워서 반환(다운로드 편의)
-    meta_out: Dict[str, Dict[str, str]] = {}
-    for k in union_keys:
-        meta = meta_map.get(k, {"uploader_name": "", "upload_time": ""})
-        meta_out[k] = {
-            "url": union_url_by_key.get(k, ""),
-            "uploader_name": meta.get("uploader_name", ""),
-            "upload_time": meta.get("upload_time", ""),
-        }
-    return meta_out, confirmed_keys, missing_keys, union_url_by_key, union_keys
+    return confirmed, confirmed_keys, missing_keys
 
 # -----------------------------------------------------------------------------
 # Downloader / Post-process
@@ -914,49 +1041,64 @@ def move_duplicate_images(directory_path: str):
 # -----------------------------------------------------------------------------
 # Main flow
 # -----------------------------------------------------------------------------
-# 1) 완전 하강(+near-bottom 프리로드)
+# IO/MutationObserver는 하강 시작 전에 주입(두 모드 공통으로 메타를 최대한 확보)
+bootstrap_observers()
+
+# === MOD: 하강 시작 전에 top jiggle 1회로 초기 로딩 유도
+pre_descent_jiggle(set(), {})  # 초기 CDP 누계 의미 없으므로 더미로 호출, 메시지 용도
+
+# 1) 완전 하강 (도중에 주기적으로 CDP/IO drain 및 로그)
 cdp_seen_keys: set[str] = set()
 cdp_url_by_key: Dict[str, str] = {}
-cdp_peak, vh, step_eff, nb_added = full_descent_and_preload(cdp_seen_keys, cdp_url_by_key)
+desc_meta_by_key: Dict[str, Dict[str, str]] = {}  # 하강 중 IO로 모은 메타(키 -> 메타)
+cdp_peak = full_descent(cdp_seen_keys, cdp_url_by_key, desc_meta_by_key)
 
-# 2) 하강 직후 CDP를 한 번 더 drain -> 타깃 최종 확정(CDP 기준)
+# 2) 하강 직후 CDP를 한 번 더 drain -> 타겟 최종 확정
 _ = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
 target_url_by_key: Dict[str, str] = dict(cdp_url_by_key)  # key -> canonical URL
-initial_target_keys = set(target_url_by_key.keys())
-print(f"message: CDP drain after descent: TargetTotalSeen={len(initial_target_keys)}, cdpPeakDuringDescent={cdp_peak}, nbAdded={nb_added}")
+target_keys = set(target_url_by_key.keys())
+TargetTotalSeen = len(target_keys)
+print(f"message: CDP drain after descent: TargetTotalSeen={TargetTotalSeen}, cdpPeakDuringDescent={cdp_peak}")
+
+# 2.5) CDP_ONLY 자동 폴백 판단
+if mode == "CDP_ONLY" and CDP_ONLY_AUTOFALLBACK:
+    min_allowed = max(CDP_ONLY_MIN_KEYS, int(cdp_peak * CDP_ONLY_MIN_RATIO_OF_PEAK))
+    if TargetTotalSeen < min_allowed:
+        print(f"message: CDP_ONLY target too low (Target={TargetTotalSeen} < MinAllowed={min_allowed}). Auto-fallback to SAFE.")
+        mode = "SAFE"
 
 # 3) 수집/다운로드 엔트리 구성
 image_entries: List[Dict[str, str]] = []
+missing_keys: List[str] = []  # SAFE에서만 의미 있음
 
 if mode == "CDP_ONLY":
-    # 업스크롤 없이 즉시 다운로드 (메타 없음)
-    for k in initial_target_keys:
+    # 업스크롤 없이 즉시 다운로드
+    # 하강 중 IO에서 모아둔 메타(desc_meta_by_key)가 있으면 반영
+    for k in target_keys:
+        meta = desc_meta_by_key.get(k, {"uploader_name": "", "upload_time": ""})
         image_entries.append({
             "url": target_url_by_key[k],
-            "uploader_name": "",
-            "upload_time": ""
+            "uploader_name": meta.get("uploader_name", ""),
+            "upload_time": meta.get("upload_time", "")
         })
 else:
-    # SAFE 모드: 업스크롤 수집(Union 확장 포함)
-    meta_map, confirmed_keys, missing_keys, union_url_by_key, union_keys = safe_upward_collect_union(initial_target_keys, target_url_by_key)
-    # 엔트리 구성: 최종 Union 기준
-    for k in union_keys:
-        m = meta_map.get(k, {"url": union_url_by_key.get(k, ""), "uploader_name": "", "upload_time": ""})
-        if not m.get("url"):
-            m["url"] = union_url_by_key.get(k, "")
-        image_entries.append({
-            "url": m["url"],
-            "uploader_name": m.get("uploader_name", ""),
-            "upload_time": m.get("upload_time", "")
-        })
-    # 리포트
-    print(f"message: SAFE summary: InitialTarget={len(initial_target_keys)}, FinalUnion={len(union_keys)}, MissingAgainstInitial={len(missing_keys)}")
-    if missing_keys:
-        print("message: Missing detail (initial CDP but not seen in union):")
-        for k in missing_keys[:50]:
-            print(f"message: MISSING key={k} url={target_url_by_key.get(k, '')}")
-        if len(missing_keys) > 50:
-            print(f"message: ...and {len(missing_keys)-50} more")
+    # SAFE 모드: 업스크롤 수집/매칭
+    confirmed_map, confirmed_keys, missing_keys = safe_upward_collect(target_keys, target_url_by_key)
+    # 엔트리 구성: 확정된 것은 confirmed_map 메타, 미싱은 하강-IO 메타로 보강(없으면 빈값)
+    for k in target_keys:
+        if k in confirmed_map:
+            image_entries.append({
+                "url": confirmed_map[k]["url"],
+                "uploader_name": confirmed_map[k]["uploader_name"],
+                "upload_time": confirmed_map[k]["upload_time"],
+            })
+        else:
+            fallback_meta = desc_meta_by_key.get(k, {"uploader_name": "", "upload_time": ""})
+            image_entries.append({
+                "url": target_url_by_key[k],
+                "uploader_name": fallback_meta.get("uploader_name", ""),
+                "upload_time": fallback_meta.get("upload_time", ""),
+            })
 
 # 4) 다운로드
 print("message: Start downloading images...")
