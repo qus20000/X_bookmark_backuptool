@@ -67,7 +67,7 @@ CONFIG = {
     # viewport 기반 하강 스텝 비율(가변 로직)
     "DOWN_STEP_RATIO_MIN": 0.60,     # 0.6 * vh
     "DOWN_STEP_RATIO_MAX": 0.90,     # 0.9 * vh
-    "DOWN_STEP_RATIO_DEFAULT": 0.80, # 기본 선택 비율(0.8 * vh)
+    "DOWN_STEP_RATIO_DEFAULT": 0.80, # 기본 선택 비율(0.8 * vh) 
 
     # near-bottom 프리로드 루프(바닥 감지 직후 왕복으로 미디어 요청 유도)
     "NB_SWINGS": 3,                  # 위↔아래 왕복 횟수(증가 시 수 초 더 소요)
