@@ -63,8 +63,8 @@ CONFIG = {
     "DOWN_DELAY_S": 0.035,            # 스크롤 호출 사이 대기
     "DOWN_BUFFER_CHECKS": 6,         # Burst 후 scrollHeight 증가 체크 횟수
     "DOWN_BUFFER_SLEEP_S": 0.18,     # 각 체크 간 대기
-    "DOWN_STALL_TOLERANCE": 5,       # scrollHeight 증가 정지 연속 허용 횟수
-    "YOFFSET_STALL_BURSTS": 5,       # 연속 Burst 동안 yOffset 변화 없음 허용 횟수
+    "DOWN_STALL_TOLERANCE": 10,       # scrollHeight 증가 정지 연속 허용 횟수
+    "YOFFSET_STALL_BURSTS": 10,       # 연속 Burst 동안 yOffset 변화 없음 허용 횟수
     "YOFFSET_EPS": 8,                # yOffset 변화 유효성 오차(px)
     "DESCENT_CDP_LOG_INTERVAL": 1,   # 하강 중 CDP/IO drain 및 로그 주기(Burst 단위, 1=매 Burst)
 
@@ -174,7 +174,7 @@ def ensure_packages(pkgs: Dict[str, str]) -> None:
 
 ensure_packages(REQUIRED_PKGS)
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
 # Selenium / Chrome bootstrap 
 # -----------------------------------------------------------------------------
 import requests
