@@ -25,7 +25,7 @@
 # 파일명 정책(결정적):
 #   - 기본은 META_if_available 모드: 메타가 있으면 uploader_time_key.ext, 없으면 key.ext
 #   - 항상 MEDIA_KEY를 포함하여 재실행/병합 시에도 파일명이 결정적
-#   - 이미 같은 파일명이 있으면 스킵(SKIP_IF_EXISTS=True 권장)
+#   - 이미 같은 파일명이 있으면 스킵(SKIP_IF_EXISTS=True 권장) 
 #
 # 배포/튜닝:
 #   - CONFIG 섹션만 수정해서 환경/성능 튜닝 가능
