@@ -2,7 +2,7 @@
 # items.ndjson(메타 포함) -> 파일명 정책으로 다운로드 + open_by_tid 오프너 생성
 #
 # 파일명 예:
-# @_rei_vrc_2025-01-06T164753_Ggn9lwRboAM0nm1_tid_1234567890.png
+# @xxxxxxxx_2025-01-06T164753_asdfasdfasdf_tid_1234567890.png
 #
 # 오프너 생성:
 # - open_by_tid.py : 드래그&드롭 + 그냥 실행하면 파일 선택창(tkinter)
