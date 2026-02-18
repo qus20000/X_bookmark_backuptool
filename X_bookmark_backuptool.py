@@ -277,16 +277,34 @@ except Exception as _e:
 # -----------------------------------------------------------------------------
 # Page open & login (필요 시)
 # -----------------------------------------------------------------------------
-if attached_mode:
-    driver.get("https://x.com/i/bookmarks")
-else:
-    driver.get("https://x.com/login")
-    print('message: Please log in manually, and press "Enter" key to continue...')
+BOOKMARKS_URL = "https://x.com/i/bookmarks"
+
+def wait_until_bookmarks(timeout_s: float = 180.0) -> bool:
+    t0 = time.time()
+    while (time.time() - t0) < timeout_s:
+        try:
+            cur = driver.current_url or ""
+        except Exception:
+            cur = ""
+        if cur.startswith(BOOKMARKS_URL):
+            return True
+        time.sleep(0.3)
+    return False
+
+driver.get(BOOKMARKS_URL)
+
+# 로그인 안 된 상태면 X가 /login 등으로 리다이렉트할 수 있음.
+# 이 경우 자동 로그인을 시도하지 말고, 현재 열린 크롬 창에서 사용자가 직접 로그인하도록 유도.
+if not wait_until_bookmarks(timeout_s=5.0):
+    print('message: Login required. Please log in manually in the opened Chrome window.')
+    print('message: After successful login, navigate to bookmarks page, then press "Enter" to continue...')
     while True:
         ch = msvcrt.getwch()
         if ch == "\r":
             break
-    driver.get("https://x.com/i/bookmarks")
+    # Enter 이후에도 실제로 북마크 페이지에 들어왔는지 확인(실수 방지)
+    if not wait_until_bookmarks(timeout_s=180.0):
+        raise RuntimeError("Could not reach bookmarks page after manual login. Please open https://x.com/i/bookmarks and retry.")
 
 # 북마크 진입 후 하드 리로드(이벤트 누락 방지)
 if HARD_RELOAD_ON_BOOKMARKS:
