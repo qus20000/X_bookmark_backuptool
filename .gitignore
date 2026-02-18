@@ -208,3 +208,8 @@ __marimo__/
 
 #project settings
 images*/
+
+# X bookmark backup runtime data
+bookmark_meta/
+downloaded_images/
+x_oauth_token.json
