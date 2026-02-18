@@ -43,11 +43,11 @@ ITEMS_PATH = os.path.join(OUT_DIR, "items.ndjson")
 STATE_PATH = os.path.join(OUT_DIR, "state.json")
 
 # 안정성 때문에 50 권장(너 환경에서 100은 next_token이 끊기는 케이스가 있었음)
-PAGE_SIZE = 50
+PAGE_SIZE = 70
 
 FORCE_NAME_ORIG = True
-STOP_IF_NO_NEW_PAGES = 3          # INCREMENTAL: 연속 N페이지 신규 0개면 종료
-PAGE_DELAY_S = 0.15               # API 호출 간 딜레이
+STOP_IF_NO_NEW_PAGES = 2          # INCREMENTAL: 연속 N페이지 신규 0개면 종료
+PAGE_DELAY_S = 0.3               # API 호출 간 딜레이
 
 INCLUDE_VIDEOS = False            # False면 photo만 저장(권장). True면 video도 저장
 
