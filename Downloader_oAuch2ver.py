@@ -6,7 +6,7 @@
 #
 # 오프너 생성:
 # - open_by_tid.py : 드래그&드롭 + 그냥 실행하면 파일 선택창(tkinter)
-# - open_by_tid.bat: .py 드롭이 안 먹는 환경 대비(배치 파일에 드롭하면 100% 인자 전달)
+# - open_by_tid.bat: .py 드롭이 안 먹는 환경 대비(배치 파일에 드롭하면 Fullsize 인자 전달)
 #
 # 실행:
 # - python download_from_items.py
