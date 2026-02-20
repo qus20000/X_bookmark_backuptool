@@ -1,4 +1,3 @@
-# collect_bookmarks_meta.py
 # X Bookmarks -> media(meta) collector (FULL / INCREMENTAL)
 #
 # 저장 포맷
@@ -34,7 +33,7 @@ import requests
 # ---------------------------------------------------------------------------
 # 사용자 설정
 # ---------------------------------------------------------------------------
-CLIENT_ID = "" # <-- 여기에 당신의 OAuth2 Client ID 입력하세요.
+CLIENT_ID = "asdfasdfasdfadsf" # <-- 여기에 당신의 OAuth2 Client ID 입력하세요.
 
 TOKEN_PATH = "x_oauth_token.json"
 

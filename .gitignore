@@ -212,4 +212,6 @@ images*/
 # X bookmark backup runtime data
 bookmark_meta/
 downloaded_images/
+bookmark_meta_oldver/
+downloaded_images_oldver/
 x_oauth_token.json

@@ -46,6 +46,8 @@ import json
 from typing import Dict, List, Tuple
 import msvcrt
 import threading
+import socket
+import urllib.request
 
 # -----------------------------------------------------------------------------
 # CONFIG: 사용자 튜닝 파라미터
@@ -53,6 +55,7 @@ import threading
 CONFIG = {
     # 연결/프로필
     "DEBUGGER_ADDRESS": "127.0.0.1:9222",
+    "ATTACH_ONLY": True,  # True면 디버거 attach 성공 전까지 새 세션을 띄우지 않음
     "USER_DATA_DIR": os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "User Data"),
     "PROFILE_DIR_NAME": "Default",
 
@@ -93,6 +96,7 @@ CONFIG = {
 
 # 매크로 변수로 CONFIG 값 할당
 DEBUGGER_ADDRESS     = CONFIG["DEBUGGER_ADDRESS"]
+ATTACH_ONLY          = CONFIG["ATTACH_ONLY"]
 USER_DATA_DIR        = CONFIG["USER_DATA_DIR"]
 PROFILE_DIR_NAME     = CONFIG["PROFILE_DIR_NAME"]
 
@@ -121,6 +125,11 @@ MAX_WORKERS          = CONFIG["MAX_WORKERS"]
 
 FILENAME_MODE        = CONFIG["FILENAME_MODE"]
 SKIP_IF_EXISTS       = CONFIG["SKIP_IF_EXISTS"]
+TID_TAG = "_tid_"
+
+BOOKMARK_META_OLDVER_DIR = "bookmark_meta_oldver"
+BOOKMARK_META_OLDVER_ITEMS_PATH = os.path.join(BOOKMARK_META_OLDVER_DIR, "items.ndjson")
+DOWNLOADED_OLDVER_DIR = "downloaded_images_oldver"
 
 # -----------------------------------------------------------------------------
 # Dependencies: pip auto-installer (최초 실행 시 필요한 패키지 자동 설치)
@@ -192,6 +201,180 @@ except Exception:
 
 print('X bookmark backuptool by qus20000\n')
 
+def _quick_guess_ext_from_url(url: str) -> str:
+    m = re.search(r"[?&]format=([a-zA-Z0-9]+)", url or "")
+    if m:
+        return "." + m.group(1).lower()
+    path = (url or "").split("?", 1)[0]
+    _, ext = os.path.splitext(path)
+    return ext.lower() if ext else ".jpg"
+
+def _quick_filename_safe(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r'[\\/*?:"<>|]+', "", s)
+    s = re.sub(r"\s+", "_", s)
+    return s
+
+def _quick_build_filename_from_oldver(item: Dict[str, str]) -> str:
+    author = (item.get("author") or "@unknown").strip() or "@unknown"
+    created_norm = (item.get("created_at") or "").replace(":", "").replace("Z", "")
+    media_key = (item.get("media_key") or "unknown").strip() or "unknown"
+    tweet_id = (item.get("tweet_id") or "0").strip() or "0"
+    url = item.get("url") or ""
+    if author.startswith("@") and not author.startswith("@_"):
+        author = "@_" + author[1:]
+    ext = _quick_guess_ext_from_url(url)
+    return _quick_filename_safe(f"{author}_{created_norm}_{media_key}{TID_TAG}{tweet_id}{ext}")
+
+def _quick_write_open_by_tid_py(out_dir: str) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    p = os.path.join(out_dir, "open_by_tid.py")
+    c = f"""import sys
+import re
+import webbrowser
+TID_TAG = {TID_TAG!r}
+def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else ""
+    if not path:
+        print("message: drag and drop an image file onto this script.")
+        return
+    m = re.search(re.escape(TID_TAG) + r"(\\d+)", path)
+    if not m:
+        print("message: tid not found in filename:", path)
+        return
+    tid = m.group(1)
+    webbrowser.open(f"https://x.com/i/web/status/{{tid}}")
+if __name__ == "__main__":
+    main()
+"""
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(c)
+
+def _run_ndjson_only_early() -> None:
+    in_path = BOOKMARK_META_OLDVER_ITEMS_PATH
+    out_dir = DOWNLOADED_OLDVER_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    _quick_write_open_by_tid_py(out_dir)
+    items: List[Dict[str, str]] = []
+    if os.path.exists(in_path):
+        with open(in_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        items.append(obj)
+                except Exception:
+                    continue
+    print(f"message: NDJSON_ONLY loaded items={len(items)} from {in_path}")
+    if not items:
+        print("message: no items to download. exiting.")
+        return
+    ok = 0
+    skipped = 0
+    fail = 0
+    result_path = os.path.join(out_dir, "download_result.txt")
+    with open(result_path, "w", encoding="utf-8") as rf:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            future_map = {}
+            for it in items:
+                url = it.get("url") or ""
+                fname = _quick_build_filename_from_oldver(it)
+                fpath = os.path.join(out_dir, fname)
+                if SKIP_IF_EXISTS and os.path.exists(fpath):
+                    skipped += 1
+                    rf.write(f"OK file={fname} status=skip_exists URL={url}\n")
+                    continue
+                future_map[ex.submit(requests.get, url, timeout=10)] = (it, fname, url, fpath)
+            for fu in tqdm(as_completed(list(future_map.keys())), total=len(future_map), desc="Downloading", unit="file"):
+                it, fname, url, fpath = future_map[fu]
+                try:
+                    resp = fu.result()
+                    resp.raise_for_status()
+                    with open(fpath, "wb") as f:
+                        f.write(resp.content)
+                    ok += 1
+                    rf.write(f"OK file={fname} status=ok URL={url}\n")
+                except Exception as e:
+                    fail += 1
+                    rf.write(f"FAIL file={fname} err={e} URL={url}\n")
+    print(f"message: Downloaded new files: {ok}")
+    print(f"message: Skipped already-downloaded files: {skipped}")
+    print(f"message: Number of failed downloads: {fail}")
+    print(f"message: result_log={result_path}")
+
+mode: str | None = None
+print("\n============================================================")
+print("Select mode:")
+print("  1) CDP_ONLY")
+print("  2) SAFE")
+print("  3) NDJSON_ONLY (quick download-only, no browser attach)")
+print("============================================================")
+print("Press '1', '2' or '3' to start...")
+while True:
+    ch = msvcrt.getwch()
+    if ch == "1":
+        mode = "CDP_ONLY"
+        break
+    if ch == "2":
+        mode = "SAFE"
+        break
+    if ch == "3":
+        mode = "NDJSON_ONLY"
+        break
+
+if mode == "NDJSON_ONLY":
+    _run_ndjson_only_early()
+    sys.exit(0)
+
+def parse_debugger_host_port(address: str) -> Tuple[str, int]:
+    host, port = address.rsplit(":", 1)
+    return host, int(port)
+
+def is_debugger_port_open(address: str, timeout_s: float = 1.0) -> bool:
+    try:
+        host, port = parse_debugger_host_port(address)
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except Exception:
+        return False
+
+def fetch_debugger_browser_version(address: str, timeout_s: float = 1.5) -> str:
+    try:
+        host, port = parse_debugger_host_port(address)
+        url = f"http://{host}:{port}/json/version"
+        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        return str(data.get("Browser", "") or "")
+    except Exception:
+        return ""
+
+def parse_chrome_major(browser_version: str) -> str:
+    # e.g. "Chrome/128.0.6613.137" -> "128"
+    m = re.search(r"Chrome/(\d+)\.", browser_version or "")
+    return m.group(1) if m else ""
+
+def find_chrome_exe() -> str:
+    candidates = [
+        os.path.join(os.environ.get("PROGRAMFILES", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
+    ]
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    return "chrome.exe"
+
+def print_attach_guide() -> None:
+    chrome_exe = find_chrome_exe()
+    _, port = parse_debugger_host_port(DEBUGGER_ADDRESS)
+    print("message: existing Chrome can be attached only when launched with remote-debugging-port.")
+    print("message: if attach fails, close all Chrome windows and relaunch Chrome with this command:")
+    print(f'message: "{chrome_exe}" --remote-debugging-port={port} --user-data-dir="{USER_DATA_DIR}" --profile-directory="{PROFILE_DIR_NAME}"')
+    print("message: then open https://x.com/i/bookmarks in that Chrome and press Enter to retry attach.")
+
 def get_chromedriver_service() -> Service:
     try:
         return Service()
@@ -203,27 +386,65 @@ def get_chromedriver_service() -> Service:
     except Exception as e:
         raise RuntimeError(f"ChromeDriver setup failed: {e}")
 
-def apply_common_chrome_options(options: webdriver.ChromeOptions) -> None:
+def build_versioned_service_for_browser(browser_version: str) -> Service | None:
+    major = parse_chrome_major(browser_version)
+    if not major:
+        return None
+    try:
+        # webdriver-manager는 major 버전 문자열도 허용
+        driver_path = ChromeDriverManager(driver_version=major).install()
+        return Service(executable_path=driver_path)
+    except Exception:
+        return None
+
+def create_chrome_driver(
+    options: webdriver.ChromeOptions,
+    service: Service | None = None,
+    browser_version: str = "",
+):
+    # 1) Selenium Manager 자동 매칭 우선 (버전 불일치 회피)
+    try:
+        return webdriver.Chrome(options=options)
+    except Exception as e_auto:
+        # 2) debugger 브라우저 메이저 버전에 맞춘 chromedriver 강제 매칭
+        ver_service = build_versioned_service_for_browser(browser_version)
+        if ver_service is not None:
+            try:
+                return webdriver.Chrome(service=ver_service, options=options)
+            except Exception:
+                pass
+        if service is not None:
+            # 3) 기존 service 경로 재시도
+            try:
+                return webdriver.Chrome(service=service, options=options)
+            except Exception:
+                raise e_auto
+        raise e_auto
+
+def apply_common_chrome_options(options: webdriver.ChromeOptions, for_attach: bool = False) -> None:
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--disable-webgpu")
     options.add_argument("--disable-accelerated-2d-canvas")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
+    # 일부 드라이버 조합에서는 attach 모드에서 아래 옵션이 invalid argument를 유발함.
+    if not for_attach:
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
     # CDP 성능 로그 활성화 (Network.* 이벤트 수집)
     options.set_capability("goog:loggingPrefs", {"performance": "ALL", "browser": "ALL"})
 
-def try_attach_existing_chrome(service: Service):
+def try_attach_existing_chrome(service: Service, browser_version: str = ""):
     try:
         options = webdriver.ChromeOptions()
-        apply_common_chrome_options(options)
+        apply_common_chrome_options(options, for_attach=True)
         options.add_experimental_option("debuggerAddress", DEBUGGER_ADDRESS)
-        driver = webdriver.Chrome(service=service, options=options)
+        driver = create_chrome_driver(options, service, browser_version=browser_version)
         print("message: attached to existing Chrome via debuggerAddress.")
         return driver
-    except Exception:
+    except Exception as e:
+        print(f"message: attach exception: {type(e).__name__}: {e}")
         return None
 
 def try_launch_with_profile(service: Service):
@@ -233,7 +454,7 @@ def try_launch_with_profile(service: Service):
         if USER_DATA_DIR and os.path.isdir(USER_DATA_DIR):
             options.add_argument(f'--user-data-dir={USER_DATA_DIR}')
             options.add_argument(f'--profile-directory={PROFILE_DIR_NAME}')
-        driver = webdriver.Chrome(service=service, options=options)
+        driver = create_chrome_driver(options, service, browser_version="")
         print("message: launched Chrome with existing user profile.")
         return driver
     except Exception:
@@ -242,16 +463,60 @@ def try_launch_with_profile(service: Service):
 def launch_fresh_session(service: Service):
     options = webdriver.ChromeOptions()
     apply_common_chrome_options(options)
-    driver = webdriver.Chrome(service=service, options=options)
+    driver = create_chrome_driver(options, service, browser_version="")
     print("message: launched fresh Chrome session.")
     return driver
 
 service = get_chromedriver_service()
-driver = try_attach_existing_chrome(service)
+driver = None
 attached_mode = False
-if driver is not None:
-    attached_mode = True
+allow_fallback_launch = (not ATTACH_ONLY)
+
+if is_debugger_port_open(DEBUGGER_ADDRESS):
+    browser_ver = fetch_debugger_browser_version(DEBUGGER_ADDRESS)
+    if browser_ver:
+        print(f"message: debugger browser = {browser_ver}")
+    driver = try_attach_existing_chrome(service, browser_version=browser_ver)
+    if driver is not None:
+        attached_mode = True
 else:
+    print(f"message: debuggerAddress {DEBUGGER_ADDRESS} is not reachable.")
+
+if driver is None:
+    print_attach_guide()
+    if ATTACH_ONLY:
+        print("message: ATTACH_ONLY=True. fallback launch is disabled.")
+        print("message: press Enter to retry attach, or press 'q' to quit.")
+    else:
+        print("message: press Enter to retry attach, 'f' to continue with fallback launch, or 'q' to quit.")
+
+    while driver is None:
+        ch = msvcrt.getwch()
+        if ch == "\r":
+            if is_debugger_port_open(DEBUGGER_ADDRESS):
+                browser_ver = fetch_debugger_browser_version(DEBUGGER_ADDRESS)
+                if browser_ver:
+                    print(f"message: debugger browser = {browser_ver}")
+                driver = try_attach_existing_chrome(service, browser_version=browser_ver)
+                if driver is not None:
+                    attached_mode = True
+                    break
+                print("message: attach failed even though debugger port is open. check Chrome/Driver version match.")
+            else:
+                print(f"message: debuggerAddress {DEBUGGER_ADDRESS} is still not reachable.")
+            print("message: after opening Chrome with remote debugging, press Enter to retry.")
+            continue
+        if ch.lower() == "q":
+            raise RuntimeError("Attach was not completed. Exiting because login session must be reused.")
+        if (not ATTACH_ONLY) and ch.lower() == "f":
+            allow_fallback_launch = True
+            break
+        if ATTACH_ONLY:
+            print("message: invalid key. press Enter(retry) or q(quit).")
+        else:
+            print("message: invalid key. press Enter(retry), f(fallback), or q(quit).")
+
+if driver is None and allow_fallback_launch:
     driver = try_launch_with_profile(service)
     if driver is not None:
         attached_mode = True
@@ -263,6 +528,9 @@ else:
             driver_path = ChromeDriverManager().install()
             service = Service(executable_path=driver_path)
             driver = launch_fresh_session(service)
+
+if driver is None:
+    raise RuntimeError("No Chrome session available. Attach failed and fallback launch is disabled.")
 
 driver.implicitly_wait(3)
 
@@ -338,41 +606,15 @@ class Logger:
         except Exception:
             pass
 
-folder_base_name = "images"
-new_folder_path = folder_base_name
-idx = 0
-while os.path.exists(new_folder_path):
-    new_folder_path = f"{folder_base_name}{idx}"
-    idx += 1
-os.mkdir(new_folder_path)
+new_folder_path = DOWNLOADED_OLDVER_DIR
+os.makedirs(new_folder_path, exist_ok=True)
 
 log_file_path = os.path.join(new_folder_path, "log.txt")
 sys.stdout = Logger(log_file_path)
 
 # -----------------------------------------------------------------------------
-# Mode selector (1= CDP_ONLY, 2 = SAFE)
+# Mode selector (1= CDP_ONLY, 2 = SAFE, 3 = NDJSON_ONLY)
 # -----------------------------------------------------------------------------
-print("\n============================================================")
-print("Select mode:")
-print("  1) CDP_ONLY : Fastest. After full descent, drain CDP media URLs and download immediately.")
-print("                No upward scan / No heavy DOM parse. During descent, a lightweight")
-print("                IntersectionObserver collects metadata opportunistically.")
-print("  2) SAFE     : Recommended. After full descent, fix CDP Target, then upward scan.")
-print("                Use DOM+IntersectionObserver to enrich metadata and match Target.")
-print("                Reports Target vs Current and logs Missing keys/urls.")
-print("============================================================")
-print("Press '1' or '2' to start...")
-
-mode = None
-while True:
-    ch = msvcrt.getwch()
-    if ch == "1":
-        mode = "CDP_ONLY"
-        break
-    if ch == "2":
-        mode = "SAFE"
-        break
-
 print(f"message: selected mode = {mode}")
 
 # -----------------------------------------------------------------------------
@@ -414,11 +656,17 @@ const articles = document.querySelectorAll('article');
 for (const art of articles) {
   try {
     if (!inRange(art)) continue;
+    let tweetId = '';
+    const statusA = art.querySelector('a[href*="/status/"]');
+    if (statusA) {
+      const href = statusA.getAttribute('href') || '';
+      const m = href.match(/\/status\/(\d+)/);
+      if (m) tweetId = m[1];
+    }
     const timeEl = art.querySelector('time');
     let dt = '';
     if (timeEl && timeEl.getAttribute('datetime')) {
       dt = timeEl.getAttribute('datetime');
-      if (dt.endsWith('.000Z')) dt = dt.slice(0, -5);
     }
     let uploader = '';
     const spans = art.querySelectorAll('span');
@@ -430,7 +678,7 @@ for (const art of articles) {
       let src = im.getAttribute('src') || '';
       if (!src) continue;
       src = src.replace(/name=[^&]+/, 'name=orig');
-      results.push({url: src, uploader_name: uploader, upload_time: dt});
+      results.push({url: src, uploader_name: uploader, upload_time: dt, tweet_id: tweetId});
     }
   } catch(e) { }
 }
@@ -444,21 +692,27 @@ try {
     window.__xBuf = [];
     window.__xSeen = new Set();
 
-    function __xPush(url, uploader, dt) {
+    function __xPush(url, uploader, dt, tid) {
       if (!url) return;
       url = url.replace(/name=[^&]+/, 'name=orig');
       if (window.__xSeen.has(url)) return;
       window.__xSeen.add(url);
-      window.__xBuf.push({url, uploader_name: uploader || '', upload_time: dt || ''});
+      window.__xBuf.push({url, uploader_name: uploader || '', upload_time: dt || '', tweet_id: tid || ''});
     }
 
     function __xExtractFromArticle(art) {
       try {
+        let tweetId = '';
+        const statusA = art.querySelector('a[href*="/status/"]');
+        if (statusA) {
+          const href = statusA.getAttribute('href') || '';
+          const m = href.match(/\/status\/(\d+)/);
+          if (m) tweetId = m[1];
+        }
         const timeEl = art.querySelector('time');
         let dt = '';
         if (timeEl && timeEl.getAttribute('datetime')) {
           dt = timeEl.getAttribute('datetime');
-          if (dt.endsWith('.000Z')) dt = dt.slice(0, -5);
         }
         let uploader = '';
         const spans = art.querySelectorAll('span');
@@ -468,7 +722,7 @@ try {
         const imgs = art.querySelectorAll('img[src*="media"]');
         for (const im of imgs) {
           const src = im.getAttribute('src') || '';
-          if (src) __xPush(src, uploader, dt);
+          if (src) __xPush(src, uploader, dt, tweetId);
         }
       } catch (e) {}
     }
@@ -554,6 +808,9 @@ def canon_media_url(url: str) -> str:
         pass
     return url
 
+def normalize_time(ts: str) -> str:
+    return (ts or "").replace(":", "").replace("Z", "")
+
 def _guess_ext_from_url(url: str) -> str:
     m = re.search(r"[?&]format=([a-zA-Z0-9]+)", url)
     if m:
@@ -570,7 +827,13 @@ def _slug(s: str) -> str:
     s = re.sub(r'\s+', '_', s)
     return s[:80]
 
-def make_deterministic_filename(url: str, uploader_name: str, upload_time: str) -> str:
+def _filename_safe(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r'[\\/*?:"<>|]+', '', s)
+    s = re.sub(r"\s+", "_", s)
+    return s
+
+def make_deterministic_filename(url: str, uploader_name: str, upload_time: str, tweet_id: str = "") -> str:
     """
     FILENAME_MODE:
       - "meta_if_available": 업로더/시간 있으면 uploader_time_key.ext, 없으면 key.ext
@@ -583,14 +846,17 @@ def make_deterministic_filename(url: str, uploader_name: str, upload_time: str) 
     if FILENAME_MODE == "key_only":
         return f"{mk}{ext}"
 
-    if FILENAME_MODE == "meta_if_available":
-        u = _slug(uploader_name)
-        t = _slug(upload_time)
-        if u or t:
-            base = "_".join([x for x in [u, t, mk] if x])
-            return f"{base}{ext}"
+    # OAuth2 downloader와 동일 규칙:
+    # @_handle_YYYY-mm-ddTHHMMSS.xxx_mediaKey_tid_<tweetid>.<ext>
+    author = (uploader_name or "@unknown").strip() or "@unknown"
+    created_norm = normalize_time(upload_time or "")
+    twid = (tweet_id or "0").strip() or "0"
 
-    return f"{mk}{ext}"
+    if author.startswith("@") and not author.startswith("@_"):
+        author = "@_" + author[1:]
+
+    name = f"{author}_{created_norm}_{mk}{TID_TAG}{twid}{ext}"
+    return _filename_safe(name)
 
 def drain_cdp_media() -> List[str]:
     # CDP 성능로그에서 media URL 추출(고유 URL, name=orig 정규화). 
@@ -653,6 +919,7 @@ def flush_io_buffer() -> List[Dict[str, str]]:
                 "url": canon_media_url(u),
                 "uploader_name": (it.get("uploader_name") or "") if isinstance(it, dict) else "",
                 "upload_time": (it.get("upload_time") or "") if isinstance(it, dict) else "",
+                "tweet_id": (it.get("tweet_id") or "") if isinstance(it, dict) else "",
             })
         except Exception:
             continue
@@ -670,7 +937,11 @@ def merge_into_meta_map(meta_map: Dict[str, Dict[str, str]], items: List[Dict[st
             continue
         prev = meta_map.get(mk)
         if not prev:
-            meta_map[mk] = {"uploader_name": it.get("uploader_name", ""), "upload_time": it.get("upload_time", "")}
+            meta_map[mk] = {
+                "uploader_name": it.get("uploader_name", ""),
+                "upload_time": it.get("upload_time", ""),
+                "tweet_id": it.get("tweet_id", ""),
+            }
             new_keys += 1
         else:
             # 빈 필드는 채움
@@ -678,6 +949,8 @@ def merge_into_meta_map(meta_map: Dict[str, Dict[str, str]], items: List[Dict[st
                 prev["uploader_name"] = it.get("uploader_name", "")
             if not prev.get("upload_time") and it.get("upload_time"):
                 prev["upload_time"] = it.get("upload_time", "")
+            if not prev.get("tweet_id") and it.get("tweet_id"):
+                prev["tweet_id"] = it.get("tweet_id", "")
     return new_keys
 
 # -----------------------------------------------------------------------------
@@ -855,6 +1128,7 @@ def _poll_once_and_confirm(target_keys: set[str], confirmed_keys: set[str], conf
                 "url": url,
                 "uploader_name": d.get("uploader_name") or "",
                 "upload_time": d.get("upload_time") or "",
+                "tweet_id": d.get("tweet_id") or "",
             })
         except Exception:
             continue
@@ -879,6 +1153,7 @@ def _poll_once_and_confirm(target_keys: set[str], confirmed_keys: set[str], conf
                     "url": u,
                     "uploader_name": it.get("uploader_name", ""),
                     "upload_time": it.get("upload_time", ""),
+                    "tweet_id": it.get("tweet_id", ""),
                 }
                 new_cnt += 1
             else:
@@ -1000,16 +1275,17 @@ def make_session() -> requests.Session:
     s.mount("https://", adapter)
     return s
 
-def download_one(index: int, data: Dict[str, str], out_dir: str) -> Tuple[bool, str | None, str, str | None]:
+def download_one(index: int, data: Dict[str, str], out_dir: str) -> Tuple[bool, str | None, str, str | None, str]:
     url = data["url"]
     uploader_name = data.get("uploader_name", "")
     upload_time = data.get("upload_time", "")
+    tweet_id = data.get("tweet_id", "")
 
-    filename = make_deterministic_filename(url, uploader_name, upload_time)
+    filename = make_deterministic_filename(url, uploader_name, upload_time, tweet_id=tweet_id)
     file_path = os.path.join(out_dir, filename)
 
     if SKIP_IF_EXISTS and os.path.exists(file_path):
-        return True, os.path.basename(file_path), url, None
+        return True, os.path.basename(file_path), url, None, "skip_exists"
 
     session = make_session()
     try:
@@ -1017,9 +1293,9 @@ def download_one(index: int, data: Dict[str, str], out_dir: str) -> Tuple[bool, 
         resp.raise_for_status()
         with open(file_path, "wb") as f:
             f.write(resp.content)
-        return True, os.path.basename(file_path), url, None
+        return True, os.path.basename(file_path), url, None, "ok"
     except Exception as e:
-        return False, None, url, str(e)
+        return False, filename, url, str(e), "error"
     finally:
         try:
             session.close()
@@ -1056,109 +1332,253 @@ def move_duplicate_images(directory_path: str):
         deleted_files = 0
     return duplicate_count, deleted_files
 
+def read_oldver_items_ndjson(items_path: str) -> List[Dict[str, str]]:
+    if not os.path.exists(items_path):
+        return []
+    items: List[Dict[str, str]] = []
+    with open(items_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    items.append(obj)
+            except Exception:
+                continue
+    return items
+
+def load_seen_media_keys_from_oldver(items_path: str) -> set[str]:
+    seen: set[str] = set()
+    for obj in read_oldver_items_ndjson(items_path):
+        mk = (obj.get("media_key") or "").strip()
+        if mk:
+            seen.add(mk)
+    return seen
+
+def append_oldver_items_ndjson(items_path: str, entries: List[Dict[str, str]]) -> Tuple[int, int]:
+    os.makedirs(os.path.dirname(items_path), exist_ok=True)
+    seen = load_seen_media_keys_from_oldver(items_path)
+    added = 0
+    with open(items_path, "a", encoding="utf-8") as f:
+        for it in entries:
+            url = canon_media_url(it.get("url", ""))
+            mk = normalize_media_key(url) or ""
+            if not mk or mk in seen:
+                continue
+            seen.add(mk)
+            obj = {
+                "tweet_id": it.get("tweet_id", "") or "",
+                "author": it.get("uploader_name", "") or "",
+                "created_at": it.get("upload_time", "") or "",
+                "created_at_norm": normalize_time(it.get("upload_time", "") or ""),
+                "media_key": mk,
+                "url": url,
+            }
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            added += 1
+    return added, len(seen)
+
+def write_open_by_tid_py(out_dir: str) -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "open_by_tid.py")
+    content = f"""import sys
+import re
+import webbrowser
+
+TID_TAG = {TID_TAG!r}
+
+def extract_tid(path: str):
+    m = re.search(re.escape(TID_TAG) + r"(\\d+)", path)
+    return m.group(1) if m else None
+
+def pick_file_gui():
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    p = filedialog.askopenfilename(
+        title="Select an image file",
+        filetypes=[("Images", "*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp"), ("All files", "*.*")]
+    )
+    root.destroy()
+    return p or None
+
+def main():
+    if len(sys.argv) >= 2:
+        p = sys.argv[1]
+    else:
+        p = pick_file_gui()
+        if not p:
+            print("message: no file selected.")
+            return
+    tid = extract_tid(p)
+    if not tid:
+        print("message: tid not found in filename:", p)
+        print("message: expected pattern:", TID_TAG + "<digits>")
+        return
+    url = f"https://x.com/i/web/status/{{tid}}"
+    print("message: open:", url)
+    webbrowser.open(url)
+
+if __name__ == "__main__":
+    main()
+"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return path
+
+def ask_download_now() -> bool:
+    print("\n============================================================")
+    print("Collection finished. Choose next action:")
+    print("  1) Download now")
+    print("  2) Exit without downloading")
+    print("============================================================")
+    print("Press '1' or '2'...")
+    while True:
+        ch = msvcrt.getwch()
+        if ch == "1":
+            return True
+        if ch == "2":
+            return False
+
+def run_download(entries: List[Dict[str, str]], out_dir: str) -> Tuple[int, int, int, int]:
+    print("message: Start downloading images...")
+    open_by_tid_path = write_open_by_tid_py(out_dir)
+    print(f"message: opener created: {open_by_tid_path}")
+
+    result_file_path = os.path.join(out_dir, "download_result.txt")
+    write_lock = threading.Lock()
+    fail_count = 0
+    ok_count = 0
+    skip_exists_count = 0
+    non_meta_ok_count = 0
+
+    from concurrent.futures import Future
+    with open(result_file_path, "w", encoding="utf-8") as result_file:
+        future_to_entry: Dict[Future, Dict[str, str]] = {}
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            for idx_, entry in enumerate(entries, start=1):
+                fu = ex.submit(download_one, idx_, entry, out_dir)
+                future_to_entry[fu] = entry
+            for fu in tqdm(as_completed(list(future_to_entry.keys())), total=len(future_to_entry), desc="Downloading", unit="file"):
+                ok, fname, url, err, status = fu.result()
+                entry = future_to_entry[fu]
+                has_meta = bool(entry.get("uploader_name") or entry.get("upload_time"))
+                with write_lock:
+                    if ok:
+                        if status == "skip_exists":
+                            skip_exists_count += 1
+                        else:
+                            ok_count += 1
+                            if not has_meta:
+                                non_meta_ok_count += 1
+                        mk = normalize_media_key(url) or ""
+                        meta_flag = "" if has_meta else " MISSING_META"
+                        result_file.write(f"OK file={fname} status={status} URL={url} KEY={mk}{meta_flag}\n")
+                    else:
+                        fail_count += 1
+                        result_file.write(f"FAIL file={fname} err={err} URL={url}\n")
+                        print(f"message: Failed to download {url}: {err}")
+
+    print(f"message: Downloaded new files: {ok_count}")
+    print(f"message: Skipped already-downloaded files: {skip_exists_count}")
+    print(f"message: Saved non-meta(raw) images: {non_meta_ok_count}")
+    print(f"message: Number of failed downloads: {fail_count}")
+    print(f"message: result_log={result_file_path}")
+    return ok_count, skip_exists_count, non_meta_ok_count, fail_count
+
 # -----------------------------------------------------------------------------
 # Main flow
 # -----------------------------------------------------------------------------
-# IO/MutationObserver는 하강 시작 전에 주입(두 모드 공통으로 메타를 최대한 확보)
-bootstrap_observers()
-
-# === MOD: 하강 시작 전에 top jiggle 1회로 초기 로딩 유도
-pre_descent_jiggle(set(), {})  # 초기 CDP 누계 의미 없으므로 더미로 호출, 메시지 용도
-
-# 1) 완전 하강 (도중에 주기적으로 CDP/IO drain 및 로그)
-cdp_seen_keys: set[str] = set()
-cdp_url_by_key: Dict[str, str] = {}
-desc_meta_by_key: Dict[str, Dict[str, str]] = {}  # 하강 중 IO로 모은 메타(키 -> 메타)
-cdp_peak = full_descent(cdp_seen_keys, cdp_url_by_key, desc_meta_by_key)
-
-# 2) 하강 직후 CDP를 한 번 더 drain -> 타겟 최종 확정
-_ = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
-target_url_by_key: Dict[str, str] = dict(cdp_url_by_key)  # key -> canonical URL
-target_keys = set(target_url_by_key.keys())
-TargetTotalSeen = len(target_keys)
-print(f"message: CDP drain after descent: TargetTotalSeen={TargetTotalSeen}, cdpPeakDuringDescent={cdp_peak}")
-
-# 2.5) CDP_ONLY 자동 폴백 판단
-if mode == "CDP_ONLY" and CDP_ONLY_AUTOFALLBACK:
-    min_allowed = max(CDP_ONLY_MIN_KEYS, int(cdp_peak * CDP_ONLY_MIN_RATIO_OF_PEAK))
-    if TargetTotalSeen < min_allowed:
-        print(f"message: CDP_ONLY target too low (Target={TargetTotalSeen} < MinAllowed={min_allowed}). Auto-fallback to SAFE.")
-        mode = "SAFE"
-
-# 3) 수집/다운로드 엔트리 구성
 image_entries: List[Dict[str, str]] = []
-missing_keys: List[str] = []  # SAFE에서만 의미 있음
 
-if mode == "CDP_ONLY":
-    # 업스크롤 없이 즉시 다운로드
-    # 하강 중 IO에서 모아둔 메타(desc_meta_by_key)가 있으면 반영
-    for k in target_keys:
-        meta = desc_meta_by_key.get(k, {"uploader_name": "", "upload_time": ""})
+if mode == "NDJSON_ONLY":
+    nd_items = read_oldver_items_ndjson(BOOKMARK_META_OLDVER_ITEMS_PATH)
+    print(f"message: NDJSON_ONLY loaded items={len(nd_items)} from {BOOKMARK_META_OLDVER_ITEMS_PATH}")
+    for obj in nd_items:
         image_entries.append({
-            "url": target_url_by_key[k],
-            "uploader_name": meta.get("uploader_name", ""),
-            "upload_time": meta.get("upload_time", "")
+            "url": obj.get("url", "") or "",
+            "uploader_name": obj.get("author", "") or "",
+            "upload_time": obj.get("created_at", "") or "",
+            "tweet_id": obj.get("tweet_id", "") or "",
         })
+    _ = run_download(image_entries, new_folder_path)
 else:
-    # SAFE 모드: 업스크롤 수집/매칭
-    confirmed_map, confirmed_keys, missing_keys = safe_upward_collect(target_keys, target_url_by_key)
-    # 엔트리 구성: 확정된 것은 confirmed_map 메타, 미싱은 하강-IO 메타로 보강(없으면 빈값)
-    for k in target_keys:
-        if k in confirmed_map:
-            image_entries.append({
-                "url": confirmed_map[k]["url"],
-                "uploader_name": confirmed_map[k]["uploader_name"],
-                "upload_time": confirmed_map[k]["upload_time"],
-            })
-        else:
-            fallback_meta = desc_meta_by_key.get(k, {"uploader_name": "", "upload_time": ""})
+    # IO/MutationObserver는 하강 시작 전에 주입(두 모드 공통으로 메타를 최대한 확보)
+    bootstrap_observers()
+
+    # === MOD: 하강 시작 전에 top jiggle 1회로 초기 로딩 유도
+    pre_descent_jiggle(set(), {})  # 초기 CDP 누계 의미 없으므로 더미로 호출, 메시지 용도
+
+    # 1) 완전 하강 (도중에 주기적으로 CDP/IO drain 및 로그)
+    cdp_seen_keys: set[str] = set()
+    cdp_url_by_key: Dict[str, str] = {}
+    desc_meta_by_key: Dict[str, Dict[str, str]] = {}  # 하강 중 IO로 모은 메타(키 -> 메타)
+    cdp_peak = full_descent(cdp_seen_keys, cdp_url_by_key, desc_meta_by_key)
+
+    # 2) 하강 직후 CDP를 한 번 더 drain -> 타겟 최종 확정
+    _ = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
+    target_url_by_key: Dict[str, str] = dict(cdp_url_by_key)  # key -> canonical URL
+    target_keys = set(target_url_by_key.keys())
+    TargetTotalSeen = len(target_keys)
+    print(f"message: CDP drain after descent: TargetTotalSeen={TargetTotalSeen}, cdpPeakDuringDescent={cdp_peak}")
+
+    # 2.5) CDP_ONLY 자동 폴백 판단
+    if mode == "CDP_ONLY" and CDP_ONLY_AUTOFALLBACK:
+        min_allowed = max(CDP_ONLY_MIN_KEYS, int(cdp_peak * CDP_ONLY_MIN_RATIO_OF_PEAK))
+        if TargetTotalSeen < min_allowed:
+            print(f"message: CDP_ONLY target too low (Target={TargetTotalSeen} < MinAllowed={min_allowed}). Auto-fallback to SAFE.")
+            mode = "SAFE"
+
+    # 3) 수집/다운로드 엔트리 구성
+    missing_keys: List[str] = []  # SAFE에서만 의미 있음
+    if mode == "CDP_ONLY":
+        # 업스크롤 없이 즉시 다운로드
+        # 하강 중 IO에서 모아둔 메타(desc_meta_by_key)가 있으면 반영
+        for k in target_keys:
+            meta = desc_meta_by_key.get(k, {"uploader_name": "", "upload_time": "", "tweet_id": ""})
             image_entries.append({
                 "url": target_url_by_key[k],
-                "uploader_name": fallback_meta.get("uploader_name", ""),
-                "upload_time": fallback_meta.get("upload_time", ""),
+                "uploader_name": meta.get("uploader_name", ""),
+                "upload_time": meta.get("upload_time", ""),
+                "tweet_id": meta.get("tweet_id", ""),
             })
+    else:
+        # SAFE 모드: 업스크롤 수집/매칭
+        confirmed_map, confirmed_keys, missing_keys = safe_upward_collect(target_keys, target_url_by_key)
+        # 엔트리 구성: 확정된 것은 confirmed_map 메타, 미싱은 하강-IO 메타로 보강(없으면 빈값)
+        for k in target_keys:
+            if k in confirmed_map:
+                image_entries.append({
+                    "url": confirmed_map[k]["url"],
+                    "uploader_name": confirmed_map[k]["uploader_name"],
+                    "upload_time": confirmed_map[k]["upload_time"],
+                    "tweet_id": confirmed_map[k].get("tweet_id", ""),
+                })
+            else:
+                fallback_meta = desc_meta_by_key.get(k, {"uploader_name": "", "upload_time": "", "tweet_id": ""})
+                image_entries.append({
+                    "url": target_url_by_key[k],
+                    "uploader_name": fallback_meta.get("uploader_name", ""),
+                    "upload_time": fallback_meta.get("upload_time", ""),
+                    "tweet_id": fallback_meta.get("tweet_id", ""),
+                })
 
-# 4) 다운로드
-print("message: Start downloading images...")
-result_file_path = os.path.join(new_folder_path, "result.txt")
-write_lock = threading.Lock()
-pass_count = 0
-ok_count = 0
-non_meta_ok_count = 0  # 메타 없이 저장된 개수(성공분 기준)
+    # 3.5) oldver 메타 누적 저장(bookmark_meta_oldver/items.ndjson)
+    oldver_added, oldver_total = append_oldver_items_ndjson(BOOKMARK_META_OLDVER_ITEMS_PATH, image_entries)
+    print(f"message: oldver ndjson appended={oldver_added}, total={oldver_total}, path={BOOKMARK_META_OLDVER_ITEMS_PATH}")
 
-from concurrent.futures import Future
-with open(result_file_path, "w", encoding="utf-8") as result_file:
-    future_to_entry: Dict[Future, Dict[str, str]] = {}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for idx_, entry in enumerate(image_entries, start=1):
-            fu = ex.submit(download_one, idx_, entry, new_folder_path)
-            future_to_entry[fu] = entry
-        for fu in tqdm(as_completed(list(future_to_entry.keys())), total=len(future_to_entry), desc="Downloading", unit="file"):
-            ok, fname, url, err = fu.result()
-            entry = future_to_entry[fu]
-            has_meta = bool(entry.get("uploader_name") or entry.get("upload_time"))
-            with write_lock:
-                if ok:
-                    ok_count += 1
-                    if not has_meta:
-                        non_meta_ok_count += 1
-                    mk = normalize_media_key(url) or ""
-                    meta_flag = "" if has_meta else " MISSING_META"
-                    result_file.write(f"{fname} , URL: {url} , KEY: {mk}{meta_flag}\n")
-                else:
-                    pass_count += 1
-                    print(f"message: Failed to download {url}: {err}")
-
-successful_downloads = ok_count
-print(f"message: Total number of successfully downloaded images: {successful_downloads}")
-print(f"message: Saved non-meta(raw) images: {non_meta_ok_count}")
-
-# 5) 후처리: 중복 파일 정리 로그(선택)
-dup_count, deleted_files = move_duplicate_images(new_folder_path)
-print(f"message: Number of duplicate files: {dup_count}")
-print(f"message: Number of deleted duplicate files: {deleted_files}")
-print(f"message: Number of failed downloads: {pass_count}")
-print(f"message: Number of errors: {0}")
+    # 4) 수집 완료 후 다운로드 여부 선택
+    if ask_download_now():
+        _ = run_download(image_entries, new_folder_path)
+    else:
+        print("message: download skipped by user choice. exiting.")
 
 # 종료
 try:
