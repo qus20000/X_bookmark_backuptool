@@ -305,14 +305,188 @@ def _run_ndjson_only_early() -> None:
     print(f"message: Number of failed downloads: {fail}")
     print(f"message: result_log={result_path}")
 
+def _run_dedupe_only_early() -> None:
+    out_dir = DOWNLOADED_OLDVER_DIR
+    dup_dir = os.path.join(out_dir, "duplicates")
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(dup_dir, exist_ok=True)
+
+    image_exts = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")
+    hash_to_paths: Dict[str, List[str]] = {}
+    moved = 0
+    unknown_moved = 0
+
+    def _is_unknown_name(path: str) -> bool:
+        return "unknown" in os.path.basename(path).lower()
+
+    for name in os.listdir(out_dir):
+        src = os.path.join(out_dir, name)
+        if not os.path.isfile(src):
+            continue
+        if not name.lower().endswith(image_exts):
+            continue
+        try:
+            with open(src, "rb") as f:
+                h = hashlib.md5(f.read()).hexdigest()
+        except Exception:
+            continue
+        hash_to_paths.setdefault(h, []).append(src)
+
+    for _, paths in hash_to_paths.items():
+        if len(paths) <= 1:
+            continue
+        # unknown 파일은 중복 폴더로 우선 격리: 가능하면 non-unknown 1개를 본 폴더에 남긴다.
+        sorted_paths = sorted(paths, key=lambda p: (1 if _is_unknown_name(p) else 0, len(os.path.basename(p)), os.path.basename(p).lower()))
+        keeper = sorted_paths[0]
+        for src in sorted_paths:
+            if src == keeper:
+                continue
+            name = os.path.basename(src)
+            base, ext = os.path.splitext(name)
+            dst = os.path.join(dup_dir, name)
+            n = 1
+            while os.path.exists(dst):
+                dst = os.path.join(dup_dir, f"{base}__dup{n}{ext}")
+                n += 1
+            try:
+                shutil.move(src, dst)
+                moved += 1
+                if _is_unknown_name(src):
+                    unknown_moved += 1
+            except Exception:
+                continue
+
+    print(f"message: dedupe scan completed. unique_hashes={len(hash_to_paths)} moved_duplicates={moved} unknown_moved={unknown_moved}")
+    print(f"message: duplicates folder: {dup_dir}")
+
+def _run_ndjson_cleanup_early() -> None:
+    path = BOOKMARK_META_OLDVER_ITEMS_PATH
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.exists(path):
+        print(f"message: ndjson not found: {path}")
+        return
+
+    def _canon_url(url: str) -> str:
+        u = (url or "").strip()
+        if not u:
+            return u
+        if "name=" in u:
+            return re.sub(r"name=[^&]+", "name=orig", u)
+        if "?" in u:
+            return u + "&name=orig"
+        return u + "?name=orig"
+
+    def _normalize_media_key(url: str) -> str:
+        m = re.search(r"/media/([^/.?]+)", url or "")
+        return m.group(1) if m else ""
+
+    def _normalize_time(ts: str) -> str:
+        return (ts or "").replace(":", "").replace("Z", "")
+
+    def _is_unknown_author(author: str) -> bool:
+        a = (author or "").strip().lower()
+        return (not a) or ("unknown" in a)
+
+    def _score(obj: Dict[str, str]) -> Tuple[int, int, int, int]:
+        # 점수가 높을수록 보존 우선
+        author = obj.get("author", "") or ""
+        created = obj.get("created_at", "") or ""
+        tweet_id = obj.get("tweet_id", "") or ""
+        url = obj.get("url", "") or ""
+        return (
+            0 if _is_unknown_author(author) else 1,
+            1 if created else 0,
+            1 if (tweet_id.isdigit() and tweet_id != "0") else 0,
+            1 if url else 0,
+        )
+
+    rows: List[Dict[str, str]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            obj["url"] = _canon_url(obj.get("url", "") or "")
+            mk = (obj.get("media_key", "") or "").strip()
+            if not mk:
+                mk = _normalize_media_key(obj["url"]) or ""
+                obj["media_key"] = mk
+            if not obj.get("created_at_norm"):
+                obj["created_at_norm"] = _normalize_time(obj.get("created_at", "") or "")
+            rows.append(obj)
+
+    before = len(rows)
+    kept: Dict[str, Dict[str, str]] = {}
+    for obj in rows:
+        mk = (obj.get("media_key", "") or "").strip()
+        key = mk if mk else (obj.get("url", "") or "")
+        if not key:
+            continue
+        prev = kept.get(key)
+        if prev is None:
+            kept[key] = obj
+            continue
+        # 더 좋은 메타를 가진 항목을 남기고, 비어있는 필드는 병합
+        if _score(obj) > _score(prev):
+            better, worse = obj, prev
+        else:
+            better, worse = prev, obj
+        for fld in ("tweet_id", "author", "created_at", "created_at_norm", "media_key", "url"):
+            if not (better.get(fld) or "") and (worse.get(fld) or ""):
+                better[fld] = worse.get(fld)
+        kept[key] = better
+
+    after = len(kept)
+    backup_path = path + ".bak"
+    shutil.copyfile(path, backup_path)
+    with open(path, "w", encoding="utf-8") as f:
+        for obj in kept.values():
+            out = {
+                "tweet_id": obj.get("tweet_id", "") or "",
+                "author": obj.get("author", "") or "",
+                "created_at": obj.get("created_at", "") or "",
+                "created_at_norm": obj.get("created_at_norm", "") or "",
+                "media_key": obj.get("media_key", "") or "",
+                "url": obj.get("url", "") or "",
+            }
+            f.write(json.dumps(out, ensure_ascii=False) + "\n")
+
+    print(f"message: ndjson cleanup completed. before={before} after={after} removed={before-after}")
+    print(f"message: cleaned file: {path}")
+    print(f"message: backup file: {backup_path}")
+
 mode: str | None = None
+backup_mode: str | None = None
+print("\n============================================================")
+print("Backup strategy:")
+print("  1) FULL backup mode     (collect all reachable URLs)")
+print("  2) PERIODIC backup mode (stop early when existing keys are detected)")
+print("============================================================")
+print("Press '1' or '2'...")
+while True:
+    ch = msvcrt.getwch()
+    if ch == "1":
+        backup_mode = "FULL"
+        break
+    if ch == "2":
+        backup_mode = "PERIODIC"
+        break
+
 print("\n============================================================")
 print("Select mode:")
 print("  1) CDP_ONLY")
 print("  2) SAFE")
 print("  3) NDJSON_ONLY (quick download-only, no browser attach)")
+print("  4) DEDUPE_ONLY (move duplicate images in downloaded_images_oldver to subfolder)")
+print("  5) NDJSON_CLEANUP (dedupe/normalize bookmark_meta_oldver/items.ndjson)")
 print("============================================================")
-print("Press '1', '2' or '3' to start...")
+print("Press '1', '2', '3', '4' or '5' to start...")
 while True:
     ch = msvcrt.getwch()
     if ch == "1":
@@ -324,9 +498,21 @@ while True:
     if ch == "3":
         mode = "NDJSON_ONLY"
         break
+    if ch == "4":
+        mode = "DEDUPE_ONLY"
+        break
+    if ch == "5":
+        mode = "NDJSON_CLEANUP"
+        break
 
 if mode == "NDJSON_ONLY":
     _run_ndjson_only_early()
+    sys.exit(0)
+if mode == "DEDUPE_ONLY":
+    _run_dedupe_only_early()
+    sys.exit(0)
+if mode == "NDJSON_CLEANUP":
+    _run_ndjson_cleanup_early()
     sys.exit(0)
 
 def parse_debugger_host_port(address: str) -> Tuple[str, int]:
@@ -890,8 +1076,13 @@ def drain_cdp_media() -> List[str]:
 
 def update_cdp_seen_from_logs(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str]) -> int:
 # CDP drain → 고유 미디어키 집합/URL 맵 갱신. 반환: 이번 호출에서 새로 추가된 key 개수 
+    _, added_keys = update_cdp_seen_from_logs_with_keys(cdp_seen_keys, cdp_url_by_key)
+    return len(added_keys)
+
+def update_cdp_seen_from_logs_with_keys(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str]) -> Tuple[int, List[str]]:
+# CDP drain → 고유 미디어키 집합/URL 맵 갱신. 반환: (새로 추가된 key 개수, 새 key 목록)
     new_urls = drain_cdp_media()
-    added = 0
+    added_keys: List[str] = []
     for u in new_urls:
         mk = normalize_media_key(u)
         if not mk:
@@ -900,8 +1091,8 @@ def update_cdp_seen_from_logs(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str,
             cdp_seen_keys.add(mk)
             if mk not in cdp_url_by_key:
                 cdp_url_by_key[mk] = u
-            added += 1
-    return added
+            added_keys.append(mk)
+    return len(added_keys), added_keys
 
 def flush_io_buffer() -> List[Dict[str, str]]:
 # IO 버퍼를 비우고 표준화된 dict 목록으로 반환. 
@@ -1011,7 +1202,8 @@ def pre_descent_jiggle(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str]) 
     print(f"message: top-jiggle done (vh={vh}, delta={delta}, cdpNew={added})")
 
 def full_descent(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str],
-                 desc_meta_by_key: Dict[str, Dict[str, str]]) -> int:
+                 desc_meta_by_key: Dict[str, Dict[str, str]],
+                 stop_when_seen_keys: set[str] | None = None) -> int:
      
     # 끝까지 하강. Burst마다 진행 로그 출력, DESCENT_CDP_LOG_INTERVAL마다 CDP/IO drain.
     # 반환: 하강 구간에서 관측한 cdpKeys 피크값(peak)
@@ -1076,7 +1268,7 @@ def full_descent(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str],
         ioNew = 0
         new_added = 0
         if (burst_idx % DESCENT_CDP_LOG_INTERVAL) == 0:
-            new_added = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
+            new_added, new_keys = update_cdp_seen_from_logs_with_keys(cdp_seen_keys, cdp_url_by_key)
             cdp_peak = max(cdp_peak, len(cdp_seen_keys))
             io_items = flush_io_buffer()
             ioNew = merge_into_meta_map(desc_meta_by_key, io_items)
@@ -1086,6 +1278,12 @@ def full_descent(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str],
                 f"heightStallSeq={stall_cycles}/{DOWN_STALL_TOLERANCE}, yStallSeq={y_stall_seq}/{YOFFSET_STALL_BURSTS}, "
                 f"cdpKeys={len(cdp_seen_keys)}, cdpNew={new_added}, ioKeys={len(desc_meta_by_key)}, ioNew={ioNew}"
             )
+            if stop_when_seen_keys:
+                hit_keys = [k for k in new_keys if k in stop_when_seen_keys]
+                if hit_keys:
+                    stop_reason = f"seen-existing-key ({hit_keys[0]})"
+                    print(f"message: stop trigger reached. seen existing media_key={hit_keys[0]}")
+                    break
         else:
             print(
                 f"debug: downBurst={burst_idx}, perBurstScrolls={DOWN_SCROLL_BURST}, "
@@ -1520,7 +1718,10 @@ else:
     cdp_seen_keys: set[str] = set()
     cdp_url_by_key: Dict[str, str] = {}
     desc_meta_by_key: Dict[str, Dict[str, str]] = {}  # 하강 중 IO로 모은 메타(키 -> 메타)
-    cdp_peak = full_descent(cdp_seen_keys, cdp_url_by_key, desc_meta_by_key)
+    already_saved_keys = load_seen_media_keys_from_oldver(BOOKMARK_META_OLDVER_ITEMS_PATH)
+    print(f"message: backup_mode={backup_mode}, loaded existing oldver keys={len(already_saved_keys)}")
+    stop_keys = already_saved_keys if backup_mode == "PERIODIC" else None
+    cdp_peak = full_descent(cdp_seen_keys, cdp_url_by_key, desc_meta_by_key, stop_when_seen_keys=stop_keys)
 
     # 2) 하강 직후 CDP를 한 번 더 drain -> 타겟 최종 확정
     _ = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
@@ -1528,6 +1729,13 @@ else:
     target_keys = set(target_url_by_key.keys())
     TargetTotalSeen = len(target_keys)
     print(f"message: CDP drain after descent: TargetTotalSeen={TargetTotalSeen}, cdpPeakDuringDescent={cdp_peak}")
+
+    if backup_mode == "PERIODIC":
+        run_target_keys = {k for k in target_keys if k not in already_saved_keys}
+        print(f"message: periodic filter applied. newTarget={len(run_target_keys)}, alreadyKnown={len(target_keys) - len(run_target_keys)}")
+    else:
+        run_target_keys = set(target_keys)
+        print(f"message: full mode target={len(run_target_keys)} (no early-stop filter)")
 
     # 2.5) CDP_ONLY 자동 폴백 판단
     if mode == "CDP_ONLY" and CDP_ONLY_AUTOFALLBACK:
@@ -1541,7 +1749,7 @@ else:
     if mode == "CDP_ONLY":
         # 업스크롤 없이 즉시 다운로드
         # 하강 중 IO에서 모아둔 메타(desc_meta_by_key)가 있으면 반영
-        for k in target_keys:
+        for k in run_target_keys:
             meta = desc_meta_by_key.get(k, {"uploader_name": "", "upload_time": "", "tweet_id": ""})
             image_entries.append({
                 "url": target_url_by_key[k],
@@ -1551,9 +1759,14 @@ else:
             })
     else:
         # SAFE 모드: 업스크롤 수집/매칭
-        confirmed_map, confirmed_keys, missing_keys = safe_upward_collect(target_keys, target_url_by_key)
+        confirmed_map = {}
+        confirmed_keys = set()
+        if run_target_keys:
+            confirmed_map, confirmed_keys, missing_keys = safe_upward_collect(run_target_keys, target_url_by_key)
+        else:
+            missing_keys = []
         # 엔트리 구성: 확정된 것은 confirmed_map 메타, 미싱은 하강-IO 메타로 보강(없으면 빈값)
-        for k in target_keys:
+        for k in run_target_keys:
             if k in confirmed_map:
                 image_entries.append({
                     "url": confirmed_map[k]["url"],
