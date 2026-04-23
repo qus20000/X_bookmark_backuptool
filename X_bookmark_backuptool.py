@@ -77,6 +77,7 @@ CONFIG = {
     "CDP_ONLY_AUTOFALLBACK": True,           # CDP_ONLY 타겟 수 낮으면 SAFE로 자동 폴백
     "CDP_ONLY_MIN_KEYS": 500,                # 최소 허용 키 수(환경에 맞게 조정)
     "CDP_ONLY_MIN_RATIO_OF_PEAK": 0.90,      # 하강 중 관측된 피크 대비 허용 최소 비율
+    "PERIODIC_STOP_HIT_STREAK": 5,           # PERIODIC: 기존 키 hit만 연속 N회 관측되면 하강 조기중단
 
     # 업스크롤(SAFE 모드에서만 사용)
     "UP_STEP_PX": 3500,              # 의도 스텝 상한(실제 stepPxEff는 뷰포트 기반으로 클램프)
@@ -115,6 +116,7 @@ HARD_RELOAD_ON_BOOKMARKS   = CONFIG["HARD_RELOAD_ON_BOOKMARKS"]
 CDP_ONLY_AUTOFALLBACK      = CONFIG["CDP_ONLY_AUTOFALLBACK"]
 CDP_ONLY_MIN_KEYS          = CONFIG["CDP_ONLY_MIN_KEYS"]
 CDP_ONLY_MIN_RATIO_OF_PEAK = CONFIG["CDP_ONLY_MIN_RATIO_OF_PEAK"]
+PERIODIC_STOP_HIT_STREAK   = CONFIG["PERIODIC_STOP_HIT_STREAK"]
 
 UP_STEP_PX           = CONFIG["UP_STEP_PX"]
 UP_DELAY_S           = CONFIG["UP_DELAY_S"]
@@ -1225,6 +1227,7 @@ def full_descent(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str],
     y_stall_seq = 0
     stop_reason = "unknown"
     cdp_peak = len(cdp_seen_keys)
+    seen_hit_streak = 0
 
     while True:
         burst_idx += 1
@@ -1280,10 +1283,32 @@ def full_descent(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str],
             )
             if stop_when_seen_keys:
                 hit_keys = [k for k in new_keys if k in stop_when_seen_keys]
-                if hit_keys:
-                    stop_reason = f"seen-existing-key ({hit_keys[0]})"
-                    print(f"message: stop trigger reached. seen existing media_key={hit_keys[0]}")
-                    break
+                fresh_keys = [k for k in new_keys if k not in stop_when_seen_keys]
+                if hit_keys and fresh_keys:
+                    if seen_hit_streak > 0:
+                        print(
+                            f"message: periodic stop-streak reset "
+                            f"(hit+new in same burst, prevStreak={seen_hit_streak}, "
+                            f"hitSample={hit_keys[0]}, newSample={fresh_keys[0]})"
+                        )
+                    seen_hit_streak = 0
+                elif hit_keys:
+                    seen_hit_streak += 1
+                    print(
+                        f"message: periodic stop-streak {seen_hit_streak}/{PERIODIC_STOP_HIT_STREAK} "
+                        f"(hitOnly, hitSample={hit_keys[0]})"
+                    )
+                    if seen_hit_streak >= PERIODIC_STOP_HIT_STREAK:
+                        stop_reason = f"seen-existing-key-streak x{seen_hit_streak} (sample={hit_keys[0]})"
+                        print(f"message: stop trigger reached by periodic hit-streak. media_key={hit_keys[0]}")
+                        break
+                else:
+                    if seen_hit_streak > 0:
+                        print(
+                            f"message: periodic stop-streak reset "
+                            f"(no hit in this burst, prevStreak={seen_hit_streak})"
+                        )
+                    seen_hit_streak = 0
         else:
             print(
                 f"debug: downBurst={burst_idx}, perBurstScrolls={DOWN_SCROLL_BURST}, "
