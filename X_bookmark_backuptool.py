@@ -48,6 +48,7 @@ import msvcrt
 import threading
 import socket
 import urllib.request
+import tempfile
 
 # -----------------------------------------------------------------------------
 # CONFIG: 사용자 튜닝 파라미터
@@ -58,6 +59,9 @@ CONFIG = {
     "ATTACH_ONLY": True,  # True면 디버거 attach 성공 전까지 새 세션을 띄우지 않음
     "USER_DATA_DIR": os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "User Data"),
     "PROFILE_DIR_NAME": "Default",
+    "AUTO_LAUNCH_DEBUG_CHROME": True,  # attach 전에 디버그 포트 Chrome 자동 실행 시도
+    "AUTO_LAUNCH_WAIT_S": 2.5,         # 자동 실행 후 포트 확인까지 대기
+    "AUTO_KILL_CHROME_BEFORE_ATTACH": True,  # auto-launch 전에 기존 chrome.exe 정리
 
     # 하강(북마크 페이지에서 스크롤 최하단까지 탐지할 때 사용되는 파라미터입니다.)
     "DOWN_SCROLL_BURST": 40,         # Burst당 스크롤 횟수
@@ -100,6 +104,9 @@ DEBUGGER_ADDRESS     = CONFIG["DEBUGGER_ADDRESS"]
 ATTACH_ONLY          = CONFIG["ATTACH_ONLY"]
 USER_DATA_DIR        = CONFIG["USER_DATA_DIR"]
 PROFILE_DIR_NAME     = CONFIG["PROFILE_DIR_NAME"]
+AUTO_LAUNCH_DEBUG_CHROME = CONFIG["AUTO_LAUNCH_DEBUG_CHROME"]
+AUTO_LAUNCH_WAIT_S   = CONFIG["AUTO_LAUNCH_WAIT_S"]
+AUTO_KILL_CHROME_BEFORE_ATTACH = CONFIG["AUTO_KILL_CHROME_BEFORE_ATTACH"]
 
 DOWN_SCROLL_BURST    = CONFIG["DOWN_SCROLL_BURST"]
 DOWN_STEP_PX         = CONFIG["DOWN_STEP_PX"]
@@ -581,6 +588,72 @@ def print_attach_guide() -> None:
     print(f'message: "{chrome_exe}" --remote-debugging-port={port} --user-data-dir="{USER_DATA_DIR}" --profile-directory="{PROFILE_DIR_NAME}"')
     print("message: then open https://x.com/i/bookmarks in that Chrome and press Enter to retry attach.")
 
+def try_auto_launch_debug_chrome() -> bool:
+    def _wait_port() -> bool:
+        time.sleep(max(0.2, float(AUTO_LAUNCH_WAIT_S)))
+        return is_debugger_port_open(DEBUGGER_ADDRESS, timeout_s=1.0)
+
+    def _popen_chrome(user_data_dir: str) -> None:
+        _, port = parse_debugger_host_port(DEBUGGER_ADDRESS)
+        args = [
+            chrome_exe,
+            "--remote-debugging-address=127.0.0.1",
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={user_data_dir}",
+            f"--profile-directory={PROFILE_DIR_NAME}",
+        ]
+        subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+
+    def _kill_existing_chrome() -> None:
+        if not AUTO_KILL_CHROME_BEFORE_ATTACH:
+            return
+        try:
+            # ignore return code; "not found" is normal when chrome is already closed.
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "chrome.exe"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+            )
+            time.sleep(0.6)
+            print("message: auto-launch pre-step: existing chrome.exe processes terminated.")
+        except Exception as e:
+            print(f"message: auto-launch pre-step warning: could not terminate chrome.exe ({type(e).__name__}: {e})")
+
+    try:
+        chrome_exe = find_chrome_exe()
+        if not chrome_exe or (chrome_exe != "chrome.exe" and (not os.path.isfile(chrome_exe))):
+            print("message: auto-launch skipped: chrome executable not found.")
+            return False
+
+        _kill_existing_chrome()
+
+        # 1st attempt: user-configured Chrome profile.
+        _popen_chrome(USER_DATA_DIR)
+        if _wait_port():
+            print(f"message: auto-launched Chrome for debuggerAddress {DEBUGGER_ADDRESS} (user profile).")
+            return True
+
+        # 2nd attempt: temporary profile fallback (avoids profile lock/policy edge cases).
+        temp_profile = os.path.join(tempfile.gettempdir(), "x-bookmark-debug-profile")
+        os.makedirs(temp_profile, exist_ok=True)
+        _popen_chrome(temp_profile)
+        if _wait_port():
+            print(f"message: auto-launched Chrome for debuggerAddress {DEBUGGER_ADDRESS} (temp profile fallback).")
+            return True
+
+        print("message: auto-launch attempted, but debugger port is still not reachable.")
+        return False
+    except Exception as e:
+        print(f"message: auto-launch failed: {type(e).__name__}: {e}")
+        return False
+
 def get_chromedriver_service() -> Service:
     try:
         return Service()
@@ -677,6 +750,7 @@ service = get_chromedriver_service()
 driver = None
 attached_mode = False
 allow_fallback_launch = (not ATTACH_ONLY)
+auto_launch_attempted = False
 
 if is_debugger_port_open(DEBUGGER_ADDRESS):
     browser_ver = fetch_debugger_browser_version(DEBUGGER_ADDRESS)
@@ -687,6 +761,15 @@ if is_debugger_port_open(DEBUGGER_ADDRESS):
         attached_mode = True
 else:
     print(f"message: debuggerAddress {DEBUGGER_ADDRESS} is not reachable.")
+    if AUTO_LAUNCH_DEBUG_CHROME:
+        auto_launch_attempted = True
+        if try_auto_launch_debug_chrome():
+            browser_ver = fetch_debugger_browser_version(DEBUGGER_ADDRESS)
+            if browser_ver:
+                print(f"message: debugger browser = {browser_ver}")
+            driver = try_attach_existing_chrome(service, browser_version=browser_ver)
+            if driver is not None:
+                attached_mode = True
 
 if driver is None:
     print_attach_guide()
@@ -709,6 +792,16 @@ if driver is None:
                     break
                 print("message: attach failed even though debugger port is open. check Chrome/Driver version match.")
             else:
+                if AUTO_LAUNCH_DEBUG_CHROME and (not auto_launch_attempted):
+                    auto_launch_attempted = True
+                    if try_auto_launch_debug_chrome():
+                        browser_ver = fetch_debugger_browser_version(DEBUGGER_ADDRESS)
+                        if browser_ver:
+                            print(f"message: debugger browser = {browser_ver}")
+                        driver = try_attach_existing_chrome(service, browser_version=browser_ver)
+                        if driver is not None:
+                            attached_mode = True
+                            break
                 print(f"message: debuggerAddress {DEBUGGER_ADDRESS} is still not reachable.")
             print("message: after opening Chrome with remote debugging, press Enter to retry.")
             continue
