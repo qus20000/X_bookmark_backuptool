@@ -1,4 +1,4 @@
-# X bookmark backuptool by qus20000
+﻿# X bookmark backuptool by qus20000
 # Windows / Python 3.9.x ~ 3.10.x 권장
 #
 # -----------------------------------------------------------------------------
@@ -129,9 +129,26 @@ FILENAME_MODE        = CONFIG["FILENAME_MODE"]
 SKIP_IF_EXISTS       = CONFIG["SKIP_IF_EXISTS"]
 TID_TAG = "_tid_"
 
-BOOKMARK_META_OLDVER_DIR = "bookmark_meta_oldver"
-BOOKMARK_META_OLDVER_ITEMS_PATH = os.path.join(BOOKMARK_META_OLDVER_DIR, "items.ndjson")
-DOWNLOADED_OLDVER_DIR = "downloaded_images_oldver"
+BOOKMARK_META_LOCAL_DIR = "bookmark_meta_local"
+BOOKMARK_META_LOCAL_ITEMS_PATH = os.path.join(BOOKMARK_META_LOCAL_DIR, "items.ndjson")
+DOWNLOADED_LOCAL_DIR = "downloaded_images_local"
+LEGACY_BOOKMARK_META_OLDVER_DIR = "bookmark_meta_oldver"
+LEGACY_BOOKMARK_META_OLDVER_ITEMS_PATH = os.path.join(LEGACY_BOOKMARK_META_OLDVER_DIR, "items.ndjson")
+LEGACY_DOWNLOADED_OLDVER_DIR = "downloaded_images_oldver"
+
+def migrate_legacy_local_paths() -> None:
+    if (not os.path.exists(BOOKMARK_META_LOCAL_DIR)) and os.path.exists(LEGACY_BOOKMARK_META_OLDVER_DIR):
+        try:
+            shutil.move(LEGACY_BOOKMARK_META_OLDVER_DIR, BOOKMARK_META_LOCAL_DIR)
+            print(f"message: migrated legacy folder {LEGACY_BOOKMARK_META_OLDVER_DIR} -> {BOOKMARK_META_LOCAL_DIR}")
+        except Exception as e:
+            print(f"message: legacy meta folder migration skipped: {e}")
+    if (not os.path.exists(DOWNLOADED_LOCAL_DIR)) and os.path.exists(LEGACY_DOWNLOADED_OLDVER_DIR):
+        try:
+            shutil.move(LEGACY_DOWNLOADED_OLDVER_DIR, DOWNLOADED_LOCAL_DIR)
+            print(f"message: migrated legacy folder {LEGACY_DOWNLOADED_OLDVER_DIR} -> {DOWNLOADED_LOCAL_DIR}")
+        except Exception as e:
+            print(f"message: legacy download folder migration skipped: {e}")
 
 # -----------------------------------------------------------------------------
 # Dependencies: pip auto-installer (최초 실행 시 필요한 패키지 자동 설치)
@@ -202,6 +219,7 @@ except Exception:
     from urllib3.util import Retry  # type: ignore
 
 print('X bookmark backuptool by qus20000\n')
+migrate_legacy_local_paths()
 
 def _quick_guess_ext_from_url(url: str) -> str:
     m = re.search(r"[?&]format=([a-zA-Z0-9]+)", url or "")
@@ -217,7 +235,7 @@ def _quick_filename_safe(s: str) -> str:
     s = re.sub(r"\s+", "_", s)
     return s
 
-def _quick_build_filename_from_oldver(item: Dict[str, str]) -> str:
+def _quick_build_filename_from_local(item: Dict[str, str]) -> str:
     author = (item.get("author") or "@unknown").strip() or "@unknown"
     created_norm = (item.get("created_at") or "").replace(":", "").replace("Z", "")
     media_key = (item.get("media_key") or "unknown").strip() or "unknown"
@@ -253,8 +271,8 @@ if __name__ == "__main__":
         f.write(c)
 
 def _run_ndjson_only_early() -> None:
-    in_path = BOOKMARK_META_OLDVER_ITEMS_PATH
-    out_dir = DOWNLOADED_OLDVER_DIR
+    in_path = BOOKMARK_META_LOCAL_ITEMS_PATH
+    out_dir = DOWNLOADED_LOCAL_DIR
     os.makedirs(out_dir, exist_ok=True)
     _quick_write_open_by_tid_py(out_dir)
     items: List[Dict[str, str]] = []
@@ -283,7 +301,7 @@ def _run_ndjson_only_early() -> None:
             future_map = {}
             for it in items:
                 url = it.get("url") or ""
-                fname = _quick_build_filename_from_oldver(it)
+                fname = _quick_build_filename_from_local(it)
                 fpath = os.path.join(out_dir, fname)
                 if SKIP_IF_EXISTS and os.path.exists(fpath):
                     skipped += 1
@@ -308,7 +326,7 @@ def _run_ndjson_only_early() -> None:
     print(f"message: result_log={result_path}")
 
 def _run_dedupe_only_early() -> None:
-    out_dir = DOWNLOADED_OLDVER_DIR
+    out_dir = DOWNLOADED_LOCAL_DIR
     dup_dir = os.path.join(out_dir, "duplicates")
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(dup_dir, exist_ok=True)
@@ -362,7 +380,7 @@ def _run_dedupe_only_early() -> None:
     print(f"message: duplicates folder: {dup_dir}")
 
 def _run_ndjson_cleanup_early() -> None:
-    path = BOOKMARK_META_OLDVER_ITEMS_PATH
+    path = BOOKMARK_META_LOCAL_ITEMS_PATH
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if not os.path.exists(path):
         print(f"message: ndjson not found: {path}")
@@ -485,8 +503,8 @@ print("Select mode:")
 print("  1) CDP_ONLY")
 print("  2) SAFE")
 print("  3) NDJSON_ONLY (quick download-only, no browser attach)")
-print("  4) DEDUPE_ONLY (move duplicate images in downloaded_images_oldver to subfolder)")
-print("  5) NDJSON_CLEANUP (dedupe/normalize bookmark_meta_oldver/items.ndjson)")
+print("  4) DEDUPE_ONLY (move duplicate images in downloaded_images_local to subfolder)")
+print("  5) NDJSON_CLEANUP (dedupe/normalize bookmark_meta_local/items.ndjson)")
 print("============================================================")
 print("Press '1', '2', '3', '4' or '5' to start...")
 while True:
@@ -794,7 +812,7 @@ class Logger:
         except Exception:
             pass
 
-new_folder_path = DOWNLOADED_OLDVER_DIR
+new_folder_path = DOWNLOADED_LOCAL_DIR
 os.makedirs(new_folder_path, exist_ok=True)
 
 log_file_path = os.path.join(new_folder_path, "log.txt")
@@ -1555,11 +1573,15 @@ def move_duplicate_images(directory_path: str):
         deleted_files = 0
     return duplicate_count, deleted_files
 
-def read_oldver_items_ndjson(items_path: str) -> List[Dict[str, str]]:
-    if not os.path.exists(items_path):
+def read_local_items_ndjson(items_path: str) -> List[Dict[str, str]]:
+    read_path = items_path
+    if (not os.path.exists(read_path)) and (read_path == BOOKMARK_META_LOCAL_ITEMS_PATH) and os.path.exists(LEGACY_BOOKMARK_META_OLDVER_ITEMS_PATH):
+        read_path = LEGACY_BOOKMARK_META_OLDVER_ITEMS_PATH
+        print(f"message: local ndjson not found; using legacy path: {read_path}")
+    if not os.path.exists(read_path):
         return []
     items: List[Dict[str, str]] = []
-    with open(items_path, "r", encoding="utf-8") as f:
+    with open(read_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -1572,17 +1594,17 @@ def read_oldver_items_ndjson(items_path: str) -> List[Dict[str, str]]:
                 continue
     return items
 
-def load_seen_media_keys_from_oldver(items_path: str) -> set[str]:
+def load_seen_media_keys_from_local(items_path: str) -> set[str]:
     seen: set[str] = set()
-    for obj in read_oldver_items_ndjson(items_path):
+    for obj in read_local_items_ndjson(items_path):
         mk = (obj.get("media_key") or "").strip()
         if mk:
             seen.add(mk)
     return seen
 
-def append_oldver_items_ndjson(items_path: str, entries: List[Dict[str, str]]) -> Tuple[int, int]:
+def append_local_items_ndjson(items_path: str, entries: List[Dict[str, str]]) -> Tuple[int, int]:
     os.makedirs(os.path.dirname(items_path), exist_ok=True)
-    seen = load_seen_media_keys_from_oldver(items_path)
+    seen = load_seen_media_keys_from_local(items_path)
     added = 0
     with open(items_path, "a", encoding="utf-8") as f:
         for it in entries:
@@ -1722,8 +1744,8 @@ def run_download(entries: List[Dict[str, str]], out_dir: str) -> Tuple[int, int,
 image_entries: List[Dict[str, str]] = []
 
 if mode == "NDJSON_ONLY":
-    nd_items = read_oldver_items_ndjson(BOOKMARK_META_OLDVER_ITEMS_PATH)
-    print(f"message: NDJSON_ONLY loaded items={len(nd_items)} from {BOOKMARK_META_OLDVER_ITEMS_PATH}")
+    nd_items = read_local_items_ndjson(BOOKMARK_META_LOCAL_ITEMS_PATH)
+    print(f"message: NDJSON_ONLY loaded items={len(nd_items)} from {BOOKMARK_META_LOCAL_ITEMS_PATH}")
     for obj in nd_items:
         image_entries.append({
             "url": obj.get("url", "") or "",
@@ -1743,8 +1765,8 @@ else:
     cdp_seen_keys: set[str] = set()
     cdp_url_by_key: Dict[str, str] = {}
     desc_meta_by_key: Dict[str, Dict[str, str]] = {}  # 하강 중 IO로 모은 메타(키 -> 메타)
-    already_saved_keys = load_seen_media_keys_from_oldver(BOOKMARK_META_OLDVER_ITEMS_PATH)
-    print(f"message: backup_mode={backup_mode}, loaded existing oldver keys={len(already_saved_keys)}")
+    already_saved_keys = load_seen_media_keys_from_local(BOOKMARK_META_LOCAL_ITEMS_PATH)
+    print(f"message: backup_mode={backup_mode}, loaded existing local keys={len(already_saved_keys)}")
     stop_keys = already_saved_keys if backup_mode == "PERIODIC" else None
     cdp_peak = full_descent(cdp_seen_keys, cdp_url_by_key, desc_meta_by_key, stop_when_seen_keys=stop_keys)
 
@@ -1808,9 +1830,9 @@ else:
                     "tweet_id": fallback_meta.get("tweet_id", ""),
                 })
 
-    # 3.5) oldver 메타 누적 저장(bookmark_meta_oldver/items.ndjson)
-    oldver_added, oldver_total = append_oldver_items_ndjson(BOOKMARK_META_OLDVER_ITEMS_PATH, image_entries)
-    print(f"message: oldver ndjson appended={oldver_added}, total={oldver_total}, path={BOOKMARK_META_OLDVER_ITEMS_PATH}")
+    # 3.5) local 메타 누적 저장(bookmark_meta_local/items.ndjson)
+    local_added, local_total = append_local_items_ndjson(BOOKMARK_META_LOCAL_ITEMS_PATH, image_entries)
+    print(f"message: local ndjson appended={local_added}, total={local_total}, path={BOOKMARK_META_LOCAL_ITEMS_PATH}")
 
     # 4) 수집 완료 후 다운로드 여부 선택
     if ask_download_now():
@@ -1830,3 +1852,5 @@ try:
     sys.stdout = sys.stdout.terminal
 except Exception:
     pass
+
+

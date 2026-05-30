@@ -1,4 +1,4 @@
-# X Bookmark Backup Tool
+﻿# X Bookmark Backup Tool
 
 X(트위터) 북마크의 이미지 URL/메타데이터를 수집하고, 원본 이미지를 로컬에 백업하는 Python 도구입니다.
 
@@ -45,11 +45,11 @@ X(트위터) 북마크의 이미지 URL/메타데이터를 수집하고, 원본 
 ## 저장소 구성
 
 - `X_bookmark_backuptool.py`: LocalVer 메인 스크립트
-- `run_bookmark_tool_oldver.ps1`, `run_bookmark_tool_oldver.bat`: LocalVer 실행 보조
+- `run_bookmark_tool_local.ps1`, `run_bookmark_tool_local.bat`: LocalVer 실행 보조
 - `X_bookmark_backuptool_oAuch2.py`: OAuth2Ver 메타 수집기
 - `Downloader_oAuch2ver.py`: OAuth2Ver 메타 기반 다운로드기
-- `bookmark_meta_oldver/`: LocalVer 메타 저장
-- `downloaded_images_oldver/`: LocalVer 이미지 저장
+- `bookmark_meta_local/`: LocalVer 메타 저장
+- `downloaded_images_local/`: LocalVer 이미지 저장
 - `bookmark_meta/`: OAuth2Ver 메타 저장
 - `downloaded_images/`: OAuth2Ver 이미지 저장
 
@@ -68,7 +68,7 @@ python X_bookmark_backuptool.py
 ```
 또는
 ```powershell
-.\run_bookmark_tool_oldver.ps1
+.\run_bookmark_tool_local.ps1
 ```
 
 ### 2) OAuth2Ver
@@ -83,8 +83,8 @@ python Downloader_oAuch2ver.py
 
 ## 출력 데이터
 
-- LocalVer 메타: `bookmark_meta_oldver/items.ndjson`
-- LocalVer 이미지: `downloaded_images_oldver/`
+- LocalVer 메타: `bookmark_meta_local/items.ndjson`
+- LocalVer 이미지: `downloaded_images_local/`
 - OAuth2Ver 메타: `bookmark_meta/items.ndjson`, `bookmark_meta/state.json`
 - OAuth2Ver 이미지: `downloaded_images/`
 
@@ -97,3 +97,4 @@ python Downloader_oAuch2ver.py
 
 - LocalVer 상세: [README_localver.md](README_localver.md)
 - OAuth2Ver 상세: [README_oauth2ver.md](README_oauth2ver.md)
+

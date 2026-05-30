@@ -1,4 +1,4 @@
-# LocalVer 가이드 (기존 `oldver`)
+﻿# LocalVer 가이드
 
 `X_bookmark_backuptool.py` 기반의 로컬 브라우저 attach 방식입니다.  
 현재 주력 사용 버전입니다.
@@ -6,9 +6,9 @@
 ## 파일
 
 - 실행 스크립트: `X_bookmark_backuptool.py`
-- 실행 보조: `run_bookmark_tool_oldver.ps1`, `run_bookmark_tool_oldver.bat`
-- 메타 출력: `bookmark_meta_oldver/items.ndjson`
-- 이미지 출력: `downloaded_images_oldver/`
+- 실행 보조: `run_bookmark_tool_local.ps1`, `run_bookmark_tool_local.bat`
+- 메타 출력: `bookmark_meta_local/items.ndjson`
+- 이미지 출력: `downloaded_images_local/`
 
 ## 실행 전 준비
 
@@ -31,7 +31,7 @@ python X_bookmark_backuptool.py
 또는:
 
 ```powershell
-.\run_bookmark_tool_oldver.ps1
+.\run_bookmark_tool_local.ps1
 ```
 
 ## 모드
@@ -59,3 +59,5 @@ python X_bookmark_backuptool.py
 1. Chrome가 실제로 `--remote-debugging-port=9222`로 실행됐는지 확인
 2. `netstat -ano | findstr :9222` 확인
 3. `chrome://version`의 Command Line에 디버그 인자 포함 여부 확인
+
+

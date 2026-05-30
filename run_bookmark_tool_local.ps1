@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 Set-Location -Path $PSScriptRoot
 
 $debugPort = 9222
@@ -11,7 +11,7 @@ $chromeExe = $chromeCandidates | Where-Object { Test-Path $_ } | Select-Object -
 
 if (-not $chromeExe) {
     Write-Host "[ERROR] chrome.exe not found."
-    Write-Host "Please install Chrome or edit run_bookmark_tool.ps1 with your chrome.exe path."
+    Write-Host "Please install Chrome or edit run_bookmark_tool_local.ps1 with your chrome.exe path."
     Read-Host "Press Enter to exit"
     exit 1
 }
@@ -35,3 +35,5 @@ Write-Host "[INFO] Running X_bookmark_backuptool.py..."
 
 Write-Host ""
 Read-Host "[INFO] Finished. Press Enter to close"
+
+

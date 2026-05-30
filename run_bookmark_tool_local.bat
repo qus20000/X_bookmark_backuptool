@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 setlocal
 
 REM Run from this script directory
@@ -14,7 +14,7 @@ set "PROFILE_DIR=Default"
 
 if not exist "%CHROME_EXE%" (
   echo [ERROR] chrome.exe not found.
-  echo Please install Chrome or edit run_bookmark_tool.bat with your chrome.exe path.
+  echo Please install Chrome or edit run_bookmark_tool_local.bat with your chrome.exe path.
   pause
   exit /b 1
 )
@@ -36,3 +36,5 @@ echo.
 echo [INFO] Finished. Press any key to close.
 pause >nul
 endlocal
+
+
