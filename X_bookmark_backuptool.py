@@ -276,6 +276,140 @@ def _quick_build_filename_from_local(item: Dict[str, str]) -> str:
     ext = _quick_guess_ext_from_url(url)
     return _quick_filename_safe(f"{author}_{created_norm}_{media_key}{TID_TAG}{tweet_id}{ext}")
 
+def _quick_video_quality_score(url: str) -> int:
+    u = (url or "").strip().lower()
+    if "video.twimg.com" not in u:
+        return -1
+    if "/aud/" in u:
+        return 10_000
+    if "/0/0/" in u:
+        return 20_000
+    m = re.search(r"/vid/(\d+)x(\d+)/", u)
+    if m:
+        return 2_000_000 + int(m.group(1)) * int(m.group(2))
+    m = re.search(r"bandwidth=(\d+)", u)
+    if m:
+        return 1_500_000 + int(m.group(1))
+    if ".mp4" in u:
+        return 1_200_000
+    if ".m3u8" in u:
+        return 200_000
+    return 100_000
+
+def _quick_pick_best_variant_from_m3u8(master_url: str) -> str:
+    try:
+        resp = requests.get(master_url, timeout=10)
+        resp.raise_for_status()
+        text = resp.text or ""
+    except Exception:
+        return master_url
+
+    best_url = master_url
+    best_score = -1
+    pending_score = None
+    for ln in [x.strip() for x in text.splitlines() if x.strip()]:
+        if ln.startswith("#EXT-X-STREAM-INF:"):
+            bw = 0
+            area = 0
+            m_bw = re.search(r"BANDWIDTH=(\d+)", ln)
+            if m_bw:
+                bw = int(m_bw.group(1))
+            m_res = re.search(r"RESOLUTION=(\d+)x(\d+)", ln)
+            if m_res:
+                area = int(m_res.group(1)) * int(m_res.group(2))
+            pending_score = bw * 10 + area
+            continue
+        if ln.startswith("#") or pending_score is None:
+            continue
+        cand = urllib.parse.urljoin(master_url, ln)
+        if "/aud/" in cand.lower() or "/0/0/" in cand.lower():
+            pending_score = None
+            continue
+        if pending_score > best_score:
+            best_score = pending_score
+            best_url = cand
+        pending_score = None
+    return best_url
+
+def _quick_resolve_best_video_url(url: str) -> str:
+    u = (url or "").strip()
+    if "video.twimg.com" not in u:
+        return u
+    if "/aud/" in u:
+        return u
+    if u.endswith(".m3u8") or ".m3u8?" in u:
+        return _quick_pick_best_variant_from_m3u8(u)
+    return u
+
+def _quick_ffmpeg_path() -> str:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        return ffmpeg
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    for c in (
+        os.path.join(base_dir, ".venv", "tools", "ffmpeg", "bin", "ffmpeg.exe"),
+        os.path.join(base_dir, "ffmpeg.exe"),
+    ):
+        if os.path.isfile(c):
+            return c
+    return ""
+
+def _quick_download_hls_to_mp4(m3u8_url: str, out_path_mp4: str) -> Tuple[bool, str | None]:
+    ffmpeg = _quick_ffmpeg_path()
+    if not ffmpeg:
+        return False, "ffmpeg_not_found"
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        m3u8_url,
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        out_path_mp4,
+    ]
+    try:
+        p = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+        if p.returncode == 0 and os.path.exists(out_path_mp4) and os.path.getsize(out_path_mp4) > 4096:
+            return True, None
+        err = (p.stderr or b"").decode("utf-8", errors="ignore").strip()
+        return False, err or "ffmpeg_failed"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+def _quick_ensure_video_filename_extension(url: str, filename: str) -> str:
+    ul = (url or "").lower()
+    fl = (filename or "").lower()
+    if ".m3u8" in ul or fl.endswith(".m3u8"):
+        base, _ = os.path.splitext(filename)
+        return base + ".mp4"
+    return filename
+
+def _quick_download_one_from_local(item: Dict[str, str], out_dir: str) -> Tuple[bool, str, str, str | None, str]:
+    url = item.get("url") or ""
+    resolved_url = _quick_resolve_best_video_url(url)
+    fname = _quick_build_filename_from_local(item)
+    fname = _quick_ensure_video_filename_extension(resolved_url, fname)
+    fpath = os.path.join(out_dir, fname)
+    if SKIP_IF_EXISTS and os.path.exists(fpath):
+        return True, fname, resolved_url, None, "skip_exists"
+    try:
+        if ".m3u8" in (resolved_url or "").lower():
+            ok_hls, hls_err = _quick_download_hls_to_mp4(resolved_url, fpath)
+            if ok_hls:
+                return True, fname, resolved_url, None, "ok_hls"
+            return False, fname, resolved_url, hls_err or "hls_download_failed", "error_hls"
+        resp = requests.get(resolved_url, timeout=10)
+        resp.raise_for_status()
+        with open(fpath, "wb") as f:
+            f.write(resp.content)
+        return True, fname, resolved_url, None, "ok"
+    except Exception as e:
+        return False, fname, resolved_url, str(e), "error"
+
 def _quick_write_open_by_tid_py(out_dir: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
     p = os.path.join(out_dir, "open_by_tid.py")
@@ -330,26 +464,23 @@ def _run_ndjson_only_early() -> None:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             future_map = {}
             for it in items:
-                url = it.get("url") or ""
-                fname = _quick_build_filename_from_local(it)
-                fpath = os.path.join(out_dir, fname)
-                if SKIP_IF_EXISTS and os.path.exists(fpath):
-                    skipped += 1
-                    rf.write(f"OK file={fname} status=skip_exists URL={url}\n")
-                    continue
-                future_map[ex.submit(requests.get, url, timeout=10)] = (it, fname, url, fpath)
+                future_map[ex.submit(_quick_download_one_from_local, it, out_dir)] = it
             for fu in tqdm(as_completed(list(future_map.keys())), total=len(future_map), desc="Downloading", unit="file"):
-                it, fname, url, fpath = future_map[fu]
                 try:
-                    resp = fu.result()
-                    resp.raise_for_status()
-                    with open(fpath, "wb") as f:
-                        f.write(resp.content)
-                    ok += 1
-                    rf.write(f"OK file={fname} status=ok URL={url}\n")
+                    ok_one, fname, url, err, status = fu.result()
+                    if ok_one:
+                        if status == "skip_exists":
+                            skipped += 1
+                        else:
+                            ok += 1
+                        rf.write(f"OK file={fname} status={status} URL={url}\n")
+                    else:
+                        fail += 1
+                        rf.write(f"FAIL file={fname} status={status} err={err} URL={url}\n")
                 except Exception as e:
                     fail += 1
-                    rf.write(f"FAIL file={fname} err={e} URL={url}\n")
+                    it = future_map.get(fu, {})
+                    rf.write(f"FAIL file=? err={e} URL={it.get('url', '')}\n")
     print(f"message: Downloaded new files: {ok}")
     print(f"message: Skipped already-downloaded files: {skipped}")
     print(f"message: Number of failed downloads: {fail}")
@@ -3832,6 +3963,40 @@ def read_local_items_ndjson(items_path: str) -> List[Dict[str, str]]:
                 continue
     return items
 
+def refresh_entries_from_local_items(
+    entries: List[Dict[str, str]],
+    items_path: str,
+) -> Tuple[List[Dict[str, str]], int]:
+    rows = read_local_items_ndjson(items_path)
+    by_key: Dict[str, Dict[str, str]] = {}
+    for r in rows:
+        mk = (r.get("media_key") or "").strip() or (normalize_media_key(r.get("url", "") or "") or "")
+        if mk:
+            by_key[mk] = r
+
+    refreshed: List[Dict[str, str]] = []
+    changed = 0
+    for it in entries:
+        mk = normalize_media_key(it.get("url", "") or "") or ""
+        src = by_key.get(mk, {}) if mk else {}
+        if not src:
+            refreshed.append(it)
+            continue
+
+        new_it = dict(it)
+        for dst, src_key in (
+            ("uploader_name", "author"),
+            ("upload_time", "created_at"),
+            ("tweet_id", "tweet_id"),
+        ):
+            new_val = src.get(src_key, "") or ""
+            if new_val and (new_it.get(dst, "") or "") != new_val:
+                new_it[dst] = new_val
+        if new_it != it:
+            changed += 1
+        refreshed.append(new_it)
+    return refreshed, changed
+
 def load_seen_media_keys_from_local(items_path: str) -> set[str]:
     seen: set[str] = set()
     for obj in read_local_items_ndjson(items_path):
@@ -4589,6 +4754,8 @@ else:
                 preloaded_cdp_url_by_key=cdp_url_by_key,
                 preloaded_cdp_meta_by_key=cdp_meta_by_key,
             )
+            all_entries, refreshed = refresh_entries_from_local_items(all_entries, BOOKMARK_META_LOCAL_ITEMS_PATH)
+            print(f"message: download entries refreshed from local ndjson after repair: updated={refreshed}")
         else:
             print("message: repair skipped by user choice.")
 
