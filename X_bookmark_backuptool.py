@@ -4,16 +4,36 @@
 # -----------------------------------------------------------------------------
 # Overview
 # -----------------------------------------------------------------------------
-# 본 스크립트는 X(트위터) 북마크 페이지에서 이미지 URL을 수집하고 이미지를 다운로드하는 도구입니다.
+# 본 스크립트는 X(트위터) 북마크 페이지에서 이미지/동영상 URL을 수집하고
+# 로컬 메타(ndjson)와 다운로드 파일을 생성하는 도구입니다.
 #
 # 공통 동작:
 # - 1) 완전 하강(북마크 페이지에서 스크롤 최하단까지 탐지)"방식을 통해 모든 트윗이 로드된 상태를 확보 
-#   2) CDP(Network.* 성능 로그)에서 pbs.twimg.com/media/... 요청을 추출 → Target 집합 구성
+#   2) CDP(Network.* 성능 로그)에서 pbs.twimg.com/media/... 및 video.twimg.com/... 요청을 추출 → Target 집합 구성
 #   3) 모드에 따라:
 #      - CDP_ONLY: 하강 직후 바로 다운로드(업스크롤 없음). 하강 중 IO(IntersectionObserver)로
 #                  수집해둔 메타(업로더/시간)가 있으면 파일명에 반영, 없으면 MEDIA_KEY로 저장.
 #      - SAFE:    업스크롤 하며 DOM+IO로 Target을 하나씩 “확정”하고 메타를 최대한 채움.
 #                  확정되지 않은(Target - Current) 키는 “메타 없이”라도 URL로 저장.
+#      - NDJSON_ONLY: 기존 bookmark_meta_local/items.ndjson 기준으로 다운로드만 수행.
+#      - VIDEO_META_REPAIR: 이미 수집된 video.twimg.com 항목의 tweet_id/author/created_at 보강만 수행.
+#
+# 미디어 범위:
+#   - IMAGE_ONLY: 기존 이미지 백업 흐름만 수행.
+#   - ALL: 이미지 + 동영상(video.twimg.com)을 수집/저장/다운로드 대상에 포함.
+#   - 동영상은 m3u8 master/variant URL을 media_key(ext_tw_video/amplify_video + id)로 정규화한다.
+#
+# 동영상 메타 복구 정책:
+#   - X 동영상 CDN URL은 원 트윗 URL/작성자/작성시간을 직접 포함하지 않는 경우가 많다.
+#   - CDP GraphQL 응답 body를 스크롤 중/수집 후 파싱하여 video media_key → tweet_id/author/created_at 매핑을 만든다.
+#   - ext_tw_video_<id>와 amplify_video_<id>는 같은 numeric id alias로 간주하여 매칭 누락을 줄인다.
+#   - GraphQL/CDP로 부족한 author/date는 기록된 최하단 yOffset/scrollHeight 기준으로 전체 업스크롤 backfill을 수행한다.
+#   - 다운로드 직전 repair 선택 시, 이미 로드한 timeline/CDP/GraphQL 캐시를 재사용하여 별도 full descent 없이 보강한다.
+#
+# 동영상 다운로드 정책:
+#   - video.twimg.com m3u8은 가능한 최고 variant를 선택하고 ffmpeg로 mp4 컨테이너에 저장한다.
+#   - ffmpeg는 PATH 또는 .venv/tools/ffmpeg/bin/ffmpeg.exe 위치를 우선 탐색한다.
+#   - 파일명 규칙은 이미지와 동일하게 author/time/media_key/tweet_id 기반 결정적 이름을 사용한다.
 #
 # 로그 정책:
 #   - 하강 단계: 매 Burst 진행 상황과 CDP/IO 누적치 로그
@@ -21,6 +41,7 @@
 #   - Save시 디버그타입 : debug: [MODE=SAFE] scrollstep=..., newURL=..., dupURL=..., batchSize=..., jsCalls=..., yOffset=..., TargetTotalSeen=..., CurrentTotalSeen=...
 #   - backup 종료시 TargetTotalSeen, CurrentTotalSeen, Missing 수를 출력하고,
 #                Missing 키/URL 상세를 log.txt에 기록(다운로드는 “키만”으로 진행)
+#   - Descent 중 GraphQL 백필은 tqdm postfix의 gql 누적값으로 표시하여 진행바 줄깨짐을 줄인다.
 #
 # 파일명 정책(결정적):
 #   - 기본은 META_if_available 모드: 메타가 있으면 uploader_time_key.ext, 없으면 key.ext
@@ -500,6 +521,7 @@ def _run_ndjson_cleanup_early() -> None:
 mode: str | None = None
 backup_mode: str | None = None
 media_mode: str = "IMAGE_ONLY"
+# IMAGE_ONLY는 기존 이미지 백업 호환 경로, ALL은 video.twimg.com 수집/다운로드까지 포함한다.
 print("\n============================================================")
 print("Media scope:")
 print("  1) IMAGE_ONLY")
@@ -3558,6 +3580,8 @@ def ensure_bottom_start(label: str = "") -> Tuple[int, int]:
     return y0, y1
 
 def ensure_repair_bottom_start(label: str = "") -> Tuple[int, int]:
+    # SAFE-Up/RepairWarmup-UpFull 직후에는 y=0 근처일 수 있다.
+    # 이때 author/date backfill은 bottom→top 방향이어야 하므로, full_descent에서 기록한 최하단 위치로 먼저 복귀한다.
     y0 = _get_scroll_y()
     if y0 <= 50 and LAST_FULL_DESCENT_BOTTOM_Y > 0:
         try:
@@ -3968,6 +3992,10 @@ def repair_video_items_meta(
     preloaded_cdp_url_by_key: Dict[str, str] | None = None,
     preloaded_cdp_meta_by_key: Dict[str, Dict[str, str]] | None = None,
 ) -> None:
+    # VIDEO_META_REPAIR:
+    # - 단독 6번 모드에서는 full descent를 다시 수행해 GraphQL/CDP 메타를 최대한 재수집한다.
+    # - 다운로드 직전 repair(preloaded_timeline=True)는 이미 수집 중 누적한 CDP/GraphQL 캐시를 재사용한다.
+    # - tweet_id는 GraphQL/CDP alias 매칭으로 먼저 채우고, author/date는 전체 업스크롤 backfill로 보강한다.
     global FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL
     cdp_seen_keys_local: set[str] = set(preloaded_cdp_seen_keys or set())
     cdp_url_by_key_local: Dict[str, str] = dict(preloaded_cdp_url_by_key or {})
@@ -4517,6 +4545,8 @@ else:
 
     # ALL 모드일 때만 비디오 보강 파이프라인 수행
     if media_mode == "ALL" and run_video_keys:
+        # 비디오 URL은 이미 CDP에서 확보되어 있으므로, 여기서는 가벼운 GraphQL/CDP 메타만 반영한다.
+        # 무거운 author/date 전체 스캔은 사용자가 다운로드 직전 repair를 선택했을 때 수행한다.
         gql_updates = backfill_tweet_id_from_graphql_bodies(cdp_meta_by_key)
         print(f"message: ALL video meta pass targets={len(run_video_keys)}, gqlBackfill={gql_updates}")
         video_entries: List[Dict[str, str]] = []
@@ -4550,6 +4580,8 @@ else:
     # 3.6) 다운로드 전에 같은 세션에서 즉시 repair 수행 여부 선택 (ALL 모드만)
     if media_mode == "ALL":
         if ask_repair_now():
+            # SAFE-Up 이후 top 근처에 있어도 repair 내부에서 기록된 descent bottom으로 복귀한 뒤
+            # author/date 전체 backfill을 수행한다.
             repair_video_items_meta(
                 BOOKMARK_META_LOCAL_ITEMS_PATH,
                 preloaded_timeline=True,
