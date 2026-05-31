@@ -1,6 +1,6 @@
 ﻿# X Bookmark Backup Tool
 
-X(트위터) 북마크의 이미지 URL/메타데이터를 수집하고, 원본 이미지를 로컬에 백업하는 Python 도구입니다.
+X(트위터) 북마크의 이미지/동영상 URL과 메타데이터를 수집하고, 원본 미디어를 로컬에 백업하는 Python 도구입니다.
 
 이 프로젝트는 2가지 수집 방식을 지원합니다.
 - `LocalVer` (주력): Chrome attach + CDP/DOM 기반 수집
@@ -9,6 +9,7 @@ X(트위터) 북마크의 이미지 URL/메타데이터를 수집하고, 원본 
 ## 프로젝트 목적
 
 - 북마크 이미지의 로컬 백업 자동화
+- 북마크 동영상(video.twimg.com / m3u8)의 로컬 백업 자동화
 - 재실행 시 중복 저장 최소화
 - 파일명에 메타데이터(작성자/시간/미디어키/트윗ID) 반영
 
@@ -17,9 +18,11 @@ X(트위터) 북마크의 이미지 URL/메타데이터를 수집하고, 원본 
 1. LocalVer (`X_bookmark_backuptool.py`)
 - Chrome 원격 디버깅 attach 방식
 - `FULL` / `PERIODIC` 백업 전략
-- `CDP_ONLY` / `SAFE` / `NDJSON_ONLY` / `DEDUPE_ONLY` / `NDJSON_CLEANUP` 모드
+- `IMAGE_ONLY` / `ALL (IMAGE + VIDEO)` 미디어 범위 선택
+- `CDP_ONLY` / `SAFE` / `NDJSON_ONLY` / `DEDUPE_ONLY` / `NDJSON_CLEANUP` / `VIDEO_META_REPAIR` 모드
 - 중복 키 감지 기반 조기 중단, NDJSON 누적 관리
 - 이미지 중복 파일 격리 및 메타 정리 유틸
+- `video.twimg.com` URL 수집, m3u8 → mp4 다운로드, 비디오 메타 repair 지원
 
 2. OAuth2Ver (`X_bookmark_backuptool_oAuch2.py`)
 - X API Bookmarks 엔드포인트 기반 수집
@@ -49,7 +52,7 @@ X(트위터) 북마크의 이미지 URL/메타데이터를 수집하고, 원본 
 - `X_bookmark_backuptool_oAuch2.py`: OAuth2Ver 메타 수집기
 - `Downloader_oAuch2ver.py`: OAuth2Ver 메타 기반 다운로드기
 - `bookmark_meta_local/`: LocalVer 메타 저장
-- `downloaded_images_local/`: LocalVer 이미지 저장
+- `downloaded_images_local/`: LocalVer 이미지/동영상 저장
 - `bookmark_meta/`: OAuth2Ver 메타 저장
 - `downloaded_images/`: OAuth2Ver 이미지 저장
 
@@ -71,6 +74,14 @@ python X_bookmark_backuptool.py
 .\run_bookmark_tool_local.ps1
 ```
 
+동영상까지 백업하려면 실행 후 `Media scope`에서 `ALL (IMAGE + VIDEO)`을 선택합니다. m3u8 동영상 다운로드에는 `ffmpeg.exe`가 필요하며, 보조 실행 스크립트는 아래 경로를 자동으로 PATH에 추가합니다.
+
+```text
+.venv\tools\ffmpeg\bin\ffmpeg.exe
+```
+
+`ffmpeg.exe`가 시스템 PATH에 이미 있으면 별도 배치 없이 사용할 수 있습니다.
+
 ### 2) OAuth2Ver
 
 1. `x_oauth_token.json` 준비
@@ -84,7 +95,7 @@ python Downloader_oAuch2ver.py
 ## 출력 데이터
 
 - LocalVer 메타: `bookmark_meta_local/items.ndjson`
-- LocalVer 이미지: `downloaded_images_local/`
+- LocalVer 이미지/동영상: `downloaded_images_local/`
 - OAuth2Ver 메타: `bookmark_meta/items.ndjson`, `bookmark_meta/state.json`
 - OAuth2Ver 이미지: `downloaded_images/`
 
@@ -92,6 +103,7 @@ python Downloader_oAuch2ver.py
 
 - OAuth2Ver는 API 플랜/권한/요금 정책 영향을 받을 수 있습니다.
 - LocalVer attach 모드는 Chrome 실행 인자(`--remote-debugging-port`)가 필수입니다.
+- LocalVer 동영상 백업은 X 페이지의 GraphQL/CDP 응답과 DOM 스캔을 함께 사용하므로, 일시적인 X 로딩 오류가 있으면 repair를 다시 실행하는 것이 유효할 수 있습니다.
 
 ## 추가 문서
 
