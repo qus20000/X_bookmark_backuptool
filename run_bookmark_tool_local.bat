@@ -1,8 +1,16 @@
-﻿@echo off
+@echo off
 setlocal
 
 REM Run from this script directory
 cd /d "%~dp0"
+
+set "FFMPEG_BIN=%~dp0.venv\tools\ffmpeg\bin"
+if exist "%FFMPEG_BIN%\ffmpeg.exe" (
+  set "PATH=%FFMPEG_BIN%;%PATH%"
+  echo [INFO] ffmpeg path added: %FFMPEG_BIN%
+) else (
+  echo [WARN] ffmpeg.exe not found at %FFMPEG_BIN%
+)
 
 set "DEBUG_PORT=9222"
 set "CHROME_EXE=%ProgramFiles%\Google\Chrome\Application\chrome.exe"
@@ -36,5 +44,3 @@ echo.
 echo [INFO] Finished. Press any key to close.
 pause >nul
 endlocal
-
-

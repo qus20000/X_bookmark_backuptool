@@ -1,4 +1,4 @@
-﻿# X bookmark backuptool by qus20000
+# X bookmark backuptool by qus20000
 # Windows / Python 3.9.x ~ 3.10.x 권장
 #
 # -----------------------------------------------------------------------------
@@ -48,6 +48,7 @@ import msvcrt
 import threading
 import socket
 import urllib.request
+import urllib.parse
 import tempfile
 
 # -----------------------------------------------------------------------------
@@ -138,6 +139,7 @@ TID_TAG = "_tid_"
 
 BOOKMARK_META_LOCAL_DIR = "bookmark_meta_local"
 BOOKMARK_META_LOCAL_ITEMS_PATH = os.path.join(BOOKMARK_META_LOCAL_DIR, "items.ndjson")
+BOOKMARK_META_LOCAL_VIDEO_ITEMS_PATH = os.path.join(BOOKMARK_META_LOCAL_DIR, "items_vid.ndjson")
 DOWNLOADED_LOCAL_DIR = "downloaded_images_local"
 LEGACY_BOOKMARK_META_OLDVER_DIR = "bookmark_meta_oldver"
 LEGACY_BOOKMARK_META_OLDVER_ITEMS_PATH = os.path.join(LEGACY_BOOKMARK_META_OLDVER_DIR, "items.ndjson")
@@ -404,8 +406,15 @@ def _run_ndjson_cleanup_early() -> None:
         return u + "?name=orig"
 
     def _normalize_media_key(url: str) -> str:
-        m = re.search(r"/media/([^/.?]+)", url or "")
-        return m.group(1) if m else ""
+        u = (url or "").strip()
+        m = re.search(r"/media/([^/.?]+)", u)
+        if m:
+            return m.group(1)
+        m = re.search(r"/(ext_tw_video|amplify_video)/(\d+)/", u)
+        if m:
+            return f"{m.group(1)}_{m.group(2)}"
+        m = re.search(r"/([^/?]+)\.mp4(?:\?|$)", u)
+        return f"video_{m.group(1)}" if m else ""
 
     def _normalize_time(ts: str) -> str:
         return (ts or "").replace(":", "").replace("Z", "")
@@ -490,6 +499,22 @@ def _run_ndjson_cleanup_early() -> None:
 
 mode: str | None = None
 backup_mode: str | None = None
+media_mode: str = "IMAGE_ONLY"
+print("\n============================================================")
+print("Media scope:")
+print("  1) IMAGE_ONLY")
+print("  2) ALL (IMAGE + VIDEO)")
+print("============================================================")
+print("Press '1' or '2'...")
+while True:
+    ch = msvcrt.getwch()
+    if ch == "1":
+        media_mode = "IMAGE_ONLY"
+        break
+    if ch == "2":
+        media_mode = "ALL"
+        break
+
 print("\n============================================================")
 print("Backup strategy:")
 print("  1) FULL backup mode     (collect all reachable URLs)")
@@ -512,8 +537,9 @@ print("  2) SAFE")
 print("  3) NDJSON_ONLY (quick download-only, no browser attach)")
 print("  4) DEDUPE_ONLY (move duplicate images in downloaded_images_local to subfolder)")
 print("  5) NDJSON_CLEANUP (dedupe/normalize bookmark_meta_local/items.ndjson)")
+print("  6) VIDEO_META_REPAIR (repair missing/unknown meta in items.ndjson videos)")
 print("============================================================")
-print("Press '1', '2', '3', '4' or '5' to start...")
+print("Press '1', '2', '3', '4', '5' or '6' to start...")
 while True:
     ch = msvcrt.getwch()
     if ch == "1":
@@ -530,6 +556,9 @@ while True:
         break
     if ch == "5":
         mode = "NDJSON_CLEANUP"
+        break
+    if ch == "6":
+        mode = "VIDEO_META_REPAIR"
         break
 
 if mode == "NDJSON_ONLY":
@@ -864,14 +893,25 @@ driver.get(BOOKMARKS_URL)
 # 이 경우 자동 로그인을 시도하지 말고, 현재 열린 크롬 창에서 사용자가 직접 로그인하도록 유도.
 if not wait_until_bookmarks(timeout_s=5.0):
     print('message: Login required. Please log in manually in the opened Chrome window.')
-    print('message: After successful login, navigate to bookmarks page, then press "Enter" to continue...')
+    print('message: After successful login, press Enter to retry (or q to quit).')
     while True:
         ch = msvcrt.getwch()
-        if ch == "\r":
+        if ch in ("q", "Q"):
+            raise RuntimeError("User aborted while waiting for manual login.")
+        if ch != "\r":
+            continue
+        try:
+            driver.get(BOOKMARKS_URL)
+        except Exception as e:
+            print(f"message: bookmarks navigation retry failed: {e}")
+        if wait_until_bookmarks(timeout_s=20.0):
             break
-    # Enter 이후에도 실제로 북마크 페이지에 들어왔는지 확인(실수 방지)
-    if not wait_until_bookmarks(timeout_s=180.0):
-        raise RuntimeError("Could not reach bookmarks page after manual login. Please open https://x.com/i/bookmarks and retry.")
+        try:
+            cur = driver.current_url or ""
+        except Exception:
+            cur = ""
+        print(f"message: still not on bookmarks. current_url={cur}")
+        print('message: complete login in Chrome, then press Enter to retry (or q to quit).')
 
 # 북마크 진입 후 하드 리로드(이벤트 누락 방지)
 if HARD_RELOAD_ON_BOOKMARKS:
@@ -956,11 +996,16 @@ for (const art of articles) {
   try {
     if (!inRange(art)) continue;
     let tweetId = '';
-    const statusA = art.querySelector('a[href*="/status/"]');
-    if (statusA) {
-      const href = statusA.getAttribute('href') || '';
+    const statusLinks = art.querySelectorAll('a[href*="/status/"]');
+    for (const a of statusLinks) {
+      const href = a.getAttribute('href') || '';
       const m = href.match(/\/status\/(\d+)/);
       if (m) tweetId = m[1];
+    }
+    if (!tweetId) {
+      const html = art.innerHTML || '';
+      const m2 = html.match(/\/status\/(\d+)/);
+      if (m2) tweetId = m2[1];
     }
     const timeEl = art.querySelector('time');
     let dt = '';
@@ -968,15 +1013,32 @@ for (const art of articles) {
       dt = timeEl.getAttribute('datetime');
     }
     let uploader = '';
-    const spans = art.querySelectorAll('span');
-    for (const s of spans) {
-      if (s.textContent && s.textContent.includes('@')) { uploader = s.textContent; break; }
+    const userNameBox = art.querySelector('[data-testid="User-Name"]');
+    if (userNameBox) {
+      const spans2 = userNameBox.querySelectorAll('span');
+      for (const s of spans2) {
+        const t = (s.textContent || '').trim();
+        if (t.startsWith('@')) { uploader = t; break; }
+      }
+    }
+    if (!uploader) {
+      const spans = art.querySelectorAll('span');
+      for (const s of spans) {
+        const t = (s.textContent || '').trim();
+        if (t.startsWith('@')) { uploader = t; break; }
+      }
     }
     const imgs = art.querySelectorAll('img[src*="media"]');
     for (const im of imgs) {
       let src = im.getAttribute('src') || '';
       if (!src) continue;
       src = src.replace(/name=[^&]+/, 'name=orig');
+      results.push({url: src, uploader_name: uploader, upload_time: dt, tweet_id: tweetId});
+    }
+    const vids = art.querySelectorAll('video[src], video source[src]');
+    for (const vd of vids) {
+      let src = vd.getAttribute('src') || '';
+      if (!src) continue;
       results.push({url: src, uploader_name: uploader, upload_time: dt, tweet_id: tweetId});
     }
   } catch(e) { }
@@ -993,7 +1055,9 @@ try {
 
     function __xPush(url, uploader, dt, tid) {
       if (!url) return;
-      url = url.replace(/name=[^&]+/, 'name=orig');
+      if (url.includes('pbs.twimg.com/media/')) {
+        url = url.replace(/name=[^&]+/, 'name=orig');
+      }
       if (window.__xSeen.has(url)) return;
       window.__xSeen.add(url);
       window.__xBuf.push({url, uploader_name: uploader || '', upload_time: dt || '', tweet_id: tid || ''});
@@ -1002,11 +1066,16 @@ try {
     function __xExtractFromArticle(art) {
       try {
         let tweetId = '';
-        const statusA = art.querySelector('a[href*="/status/"]');
-        if (statusA) {
-          const href = statusA.getAttribute('href') || '';
+        const statusLinks = art.querySelectorAll('a[href*="/status/"]');
+        for (const a of statusLinks) {
+          const href = a.getAttribute('href') || '';
           const m = href.match(/\/status\/(\d+)/);
           if (m) tweetId = m[1];
+        }
+        if (!tweetId) {
+          const html = art.innerHTML || '';
+          const m2 = html.match(/\/status\/(\d+)/);
+          if (m2) tweetId = m2[1];
         }
         const timeEl = art.querySelector('time');
         let dt = '';
@@ -1014,13 +1083,29 @@ try {
           dt = timeEl.getAttribute('datetime');
         }
         let uploader = '';
-        const spans = art.querySelectorAll('span');
-        for (const s of spans) {
-          if (s.textContent && s.textContent.includes('@')) { uploader = s.textContent; break; }
+        const userNameBox = art.querySelector('[data-testid="User-Name"]');
+        if (userNameBox) {
+          const spans2 = userNameBox.querySelectorAll('span');
+          for (const s of spans2) {
+            const t = (s.textContent || '').trim();
+            if (t.startsWith('@')) { uploader = t; break; }
+          }
+        }
+        if (!uploader) {
+          const spans = art.querySelectorAll('span');
+          for (const s of spans) {
+            const t = (s.textContent || '').trim();
+            if (t.startsWith('@')) { uploader = t; break; }
+          }
         }
         const imgs = art.querySelectorAll('img[src*="media"]');
         for (const im of imgs) {
           const src = im.getAttribute('src') || '';
+          if (src) __xPush(src, uploader, dt, tweetId);
+        }
+        const vids = art.querySelectorAll('video[src], video source[src]');
+        for (const vd of vids) {
+          const src = vd.getAttribute('src') || '';
           if (src) __xPush(src, uploader, dt, tweetId);
         }
       } catch (e) {}
@@ -1082,30 +1167,41 @@ try {
 # Utilities 
 # -----------------------------------------------------------------------------
 def normalize_media_key(url: str) -> str | None:
-    """pbs.twimg.com/media/<MEDIA_KEY>[.ext]?... → MEDIA_KEY 추출(실패 시 None)."""
+    """이미지/비디오 URL에서 결정적 키를 추출(실패 시 None)."""
     try:
-        if "pbs.twimg.com/media/" not in url:
+        u = (url or "").strip()
+        if not u:
             return None
-        m = re.search(r"/media/([^/.?]+)", url)
-        if not m:
-            return None
-        return m.group(1)
+        if "pbs.twimg.com/media/" in u:
+            m = re.search(r"/media/([^/.?]+)", u)
+            return m.group(1) if m else None
+        # X GIF/동영상 URL (video.twimg.com)
+        m = re.search(r"/(ext_tw_video|amplify_video)/(\d+)/", u)
+        if m:
+            return f"{m.group(1)}_{m.group(2)}"
+        # fallback: 파일명 기반 키 (.mp4)
+        m = re.search(r"/([^/?]+)\.mp4(?:\?|$)", u)
+        if m:
+            return f"video_{m.group(1)}"
+        return None
     except Exception:
         return None
 
 def canon_media_url(url: str) -> str:
-    """name=orig 로 정규화(기존 파라미터 유지)."""
+    """이미지는 name=orig 정규화, 비디오는 원본 URL 유지."""
     try:
-        if "name=" in url:
-            url = re.sub(r"name=[^&]+", "name=orig", url)
-        else:
-            if "?" in url:
-                url = url + "&name=orig"
+        u = (url or "").strip()
+        if "pbs.twimg.com/media/" in u:
+            if "name=" in u:
+                u = re.sub(r"name=[^&]+", "name=orig", u)
             else:
-                url = url + "?name=orig"
+                if "?" in u:
+                    u = u + "&name=orig"
+                else:
+                    u = u + "?name=orig"
+        return u
     except Exception:
-        pass
-    return url
+        return url
 
 def normalize_time(ts: str) -> str:
     return (ts or "").replace(":", "").replace("Z", "")
@@ -1119,6 +1215,132 @@ def _guess_ext_from_url(url: str) -> str:
     if ext:
         return ext.lower()
     return ".jpg"
+
+def _video_quality_score(url: str) -> int:
+    """Higher is better. Prefer MP4 vid variants with larger resolution."""
+    u = (url or "").strip().lower()
+    if "video.twimg.com" not in u:
+        return -1
+    if "/aud/" in u:
+        return 10_000
+    if "/0/0/" in u:
+        return 20_000
+    m = re.search(r"/vid/(\d+)x(\d+)/", u)
+    if m:
+        w = int(m.group(1))
+        h = int(m.group(2))
+        return 2_000_000 + (w * h)
+    m = re.search(r"bandwidth=(\d+)", u)
+    if m:
+        return 1_500_000 + int(m.group(1))
+    if u.endswith(".mp4") or ".mp4?" in u:
+        return 1_200_000
+    if u.endswith(".m3u8") or ".m3u8?" in u:
+        return 200_000
+    return 100_000
+
+def _pick_best_variant_from_m3u8(master_url: str, session: requests.Session) -> str:
+    """Return best variant URL from m3u8 master playlist. Fallback to input URL."""
+    try:
+        resp = session.get(master_url, timeout=10)
+        resp.raise_for_status()
+        text = resp.text or ""
+    except Exception:
+        return master_url
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    best_url = master_url
+    best_score = -1
+    pending_score = None
+
+    for ln in lines:
+        if ln.startswith("#EXT-X-STREAM-INF:"):
+            bw = 0
+            area = 0
+            m_bw = re.search(r"BANDWIDTH=(\d+)", ln)
+            if m_bw:
+                bw = int(m_bw.group(1))
+            m_res = re.search(r"RESOLUTION=(\d+)x(\d+)", ln)
+            if m_res:
+                area = int(m_res.group(1)) * int(m_res.group(2))
+            pending_score = (bw * 10) + area
+            continue
+        if ln.startswith("#"):
+            continue
+        if pending_score is None:
+            continue
+        cand = urllib.parse.urljoin(master_url, ln)
+        cl = cand.lower()
+        if "/aud/" in cl or "/0/0/" in cl:
+            pending_score = None
+            continue
+        score = pending_score
+        if score > best_score:
+            best_score = score
+            best_url = cand
+        pending_score = None
+
+    return best_url
+
+def is_preferred_video_mp4_url(url: str) -> bool:
+    u = (url or "").lower()
+    if "video.twimg.com/" not in u:
+        return False
+    if "/aud/" in u or "/0/0/" in u:
+        return False
+    if ".mp4" not in u:
+        return False
+    # prefer complete variant path: .../vid/<codec>/<WxH>/<file>.mp4
+    return re.search(r"/vid/[^/]+/\d+x\d+/[^/?]+\.mp4(?:\?|$)", u) is not None
+
+def resolve_best_video_url(url: str, session: requests.Session) -> str:
+    """Resolve to higher-quality video URL when possible."""
+    u = (url or "").strip()
+    if "video.twimg.com" not in u:
+        return u
+    if "/aud/" in u:
+        return u
+    if u.endswith(".m3u8") or ".m3u8?" in u:
+        # master -> best variant. If variant still m3u8, keep it as is.
+        return _pick_best_variant_from_m3u8(u, session)
+    return u
+
+def _download_hls_to_mp4(m3u8_url: str, out_path_mp4: str) -> Tuple[bool, str | None]:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        # VSCode Run/Debug 등 PATH 미주입 환경을 위해 로컬 경로 fallback 탐색
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        local_candidates = [
+            os.path.join(base_dir, ".venv", "tools", "ffmpeg", "bin", "ffmpeg.exe"),
+            os.path.join(base_dir, "ffmpeg.exe"),
+        ]
+        for c in local_candidates:
+            if os.path.isfile(c):
+                ffmpeg = c
+                break
+    if not ffmpeg:
+        return False, "ffmpeg_not_found"
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        m3u8_url,
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        out_path_mp4,
+    ]
+    try:
+        p = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+        if p.returncode == 0 and os.path.exists(out_path_mp4) and os.path.getsize(out_path_mp4) > 4096:
+            return True, None
+        err = (p.stderr or b"").decode("utf-8", errors="ignore").strip()
+        return False, err or "ffmpeg_failed"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 def _slug(s: str) -> str:
     s = (s or "").strip()
@@ -1157,9 +1379,58 @@ def make_deterministic_filename(url: str, uploader_name: str, upload_time: str, 
     name = f"{author}_{created_norm}_{mk}{TID_TAG}{twid}{ext}"
     return _filename_safe(name)
 
-def drain_cdp_media() -> List[str]:
-    # CDP 성능로그에서 media URL 추출(고유 URL, name=orig 정규화). 
-    urls: List[str] = []
+def ensure_video_filename_extension(url: str, filename: str) -> str:
+    u = (url or "").lower()
+    if ".m3u8" in u:
+        base, _ = os.path.splitext(filename)
+        return base + ".mp4"
+    return filename
+
+def _extract_status_id_from_text(s: str) -> str:
+    m = re.search(r"/status/(\d+)", s or "")
+    return m.group(1) if m else ""
+
+def _extract_status_id_deep(obj) -> str:
+    try:
+        if obj is None:
+            return ""
+        if isinstance(obj, str):
+            return _extract_status_id_from_text(obj)
+        if isinstance(obj, dict):
+            for k in ("documentURL", "url", "referer", "referrer", "initiator"):
+                if k in obj:
+                    tid = _extract_status_id_deep(obj.get(k))
+                    if tid:
+                        return tid
+            for v in obj.values():
+                tid = _extract_status_id_deep(v)
+                if tid:
+                    return tid
+            return ""
+        if isinstance(obj, list):
+            for v in obj:
+                tid = _extract_status_id_deep(v)
+                if tid:
+                    return tid
+        return ""
+    except Exception:
+        return ""
+
+# CDP 이벤트 간(tweet_id) 연결 캐시
+CDP_TID_BY_REQUEST_ID: Dict[str, str] = {}
+CDP_TID_BY_MEDIA_KEY: Dict[str, str] = {}
+CDP_TID_SOURCE_BY_MEDIA_KEY: Dict[str, str] = {}
+CDP_REQ_URL_BY_ID: Dict[str, str] = {}
+CDP_RESP_MIME_BY_ID: Dict[str, str] = {}
+CDP_FINISHED_REQ_IDS: set[str] = set()
+CDP_GRAPHQL_BODY_PARSED_REQ_IDS: set[str] = set()
+LAST_FULL_DESCENT_BOTTOM_Y = 0
+LAST_FULL_DESCENT_SCROLL_H = 0
+FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL = 0
+
+def drain_cdp_media_with_meta() -> List[Dict[str, str]]:
+    # CDP 성능로그에서 이미지/비디오 URL + 가능한 tweet_id 추출.
+    out: List[Dict[str, str]] = []
     seen = set()
     try:
         logs = driver.get_log("performance")
@@ -1171,32 +1442,411 @@ def drain_cdp_media() -> List[str]:
             method = msg.get("method", "")
             params = msg.get("params", {})
             url = None
+            tweet_id = ""
+            req_id = (params.get("requestId", "") or "").strip()
             if method == "Network.requestWillBeSent":
-                req = params.get("request", {})
+                req = params.get("request", {}) or {}
                 url = req.get("url")
+                if req_id and url:
+                    CDP_REQ_URL_BY_ID[req_id] = str(url)
+                tweet_id = _extract_status_id_from_text(params.get("documentURL", "") or "")
+                if not tweet_id:
+                    tweet_id = _extract_status_id_from_text(req.get("headers", {}).get("Referer", "") if isinstance(req.get("headers"), dict) else "")
+                if not tweet_id:
+                    initiator = params.get("initiator", {}) or {}
+                    if isinstance(initiator, dict):
+                        tweet_id = _extract_status_id_from_text(initiator.get("url", "") or "")
+                if not tweet_id:
+                    tweet_id = _extract_status_id_deep(params)
+                if req_id and tweet_id:
+                    CDP_TID_BY_REQUEST_ID[req_id] = tweet_id
             elif method == "Network.responseReceived":
                 res = params.get("response", {})
                 url = res.get("url")
-            if not url or "pbs.twimg.com/media/" not in url:
+                if req_id and url:
+                    CDP_REQ_URL_BY_ID[req_id] = str(url)
+                if req_id:
+                    CDP_RESP_MIME_BY_ID[req_id] = str(res.get("mimeType") or "")
+                if req_id:
+                    tweet_id = CDP_TID_BY_REQUEST_ID.get(req_id, "")
+                if not tweet_id:
+                    tweet_id = _extract_status_id_deep(params)
+            elif method == "Network.loadingFinished":
+                if req_id:
+                    CDP_FINISHED_REQ_IDS.add(req_id)
+                continue
+            if not url:
+                continue
+            is_image = ("pbs.twimg.com/media/" in url)
+            is_video = is_preferred_video_mp4_url(url)
+            is_video_master = ("video.twimg.com/" in url and ".m3u8" in url)
+            if not (is_image or is_video or is_video_master):
                 continue
             cu = canon_media_url(url)
+            if not tweet_id:
+                mk2 = normalize_media_key(cu) or ""
+                if mk2:
+                    tweet_id = CDP_TID_BY_MEDIA_KEY.get(mk2, "")
             if cu not in seen:
                 seen.add(cu)
-                urls.append(cu)
+                out.append({"url": cu, "tweet_id": tweet_id})
+            if tweet_id:
+                mk = normalize_media_key(cu) or ""
+                if mk and not CDP_TID_BY_MEDIA_KEY.get(mk):
+                    CDP_TID_BY_MEDIA_KEY[mk] = tweet_id
+                    CDP_TID_SOURCE_BY_MEDIA_KEY[mk] = "cdp"
         except Exception:
             continue
-    return urls
+    return out
+
+def _iter_dicts(x):
+    if isinstance(x, dict):
+        yield x
+        for v in x.values():
+            yield from _iter_dicts(v)
+    elif isinstance(x, list):
+        for v in x:
+            yield from _iter_dicts(v)
+
+def _at_handle(sn: str) -> str:
+    s = (sn or "").strip()
+    if not s:
+        return ""
+    return s if s.startswith("@") else f"@{s}"
+
+def _dict_path(root: dict, keys: List[str]):
+    cur = root
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+def _screen_name_from_graphql_node(d: dict) -> str:
+    paths = [
+        ["core", "user_results", "result", "legacy", "screen_name"],
+        ["user_results", "result", "legacy", "screen_name"],
+        ["user", "result", "legacy", "screen_name"],
+        ["author", "legacy", "screen_name"],
+        ["legacy", "screen_name"],
+        ["screen_name"],
+    ]
+    for p in paths:
+        v = _dict_path(d, p)
+        if isinstance(v, str) and v.strip():
+            return _at_handle(v)
+    return ""
+
+def _tweet_meta_from_graphql_node(d: dict, user_screen_by_id: Dict[str, str]) -> Dict[str, str]:
+    legacy = d.get("legacy") if isinstance(d.get("legacy"), dict) else {}
+    created_at = (legacy.get("created_at") or d.get("created_at") or "").strip()
+    tid = ""
+    if isinstance(legacy, dict):
+        tid = (legacy.get("id_str") or "").strip()
+    if not tid:
+        tid = (d.get("rest_id") or d.get("id_str") or "").strip()
+
+    # Avoid treating user objects as tweets. Tweet-like legacy nodes normally have
+    # created_at/user_id_str/full_text/entities or nested media/card data.
+    looks_tweet_like = bool(
+        created_at
+        or (isinstance(legacy, dict) and (
+            legacy.get("user_id_str")
+            or legacy.get("full_text")
+            or legacy.get("entities")
+            or legacy.get("extended_entities")
+        ))
+        or d.get("core")
+        or d.get("card")
+    )
+    if not tid.isdigit() or not looks_tweet_like:
+        return {}
+
+    author = _screen_name_from_graphql_node(d)
+    if not author and isinstance(legacy, dict):
+        uid = (legacy.get("user_id_str") or "").strip()
+        if uid:
+            author = user_screen_by_id.get(uid, "")
+    return {"tweet_id": tid, "author": author, "created_at": created_at}
+
+def _merge_graphql_video_meta(a: Dict[str, str], b: Dict[str, str]) -> Dict[str, str]:
+    out = dict(a or {})
+    for k in ("tweet_id", "author", "created_at"):
+        if not (out.get(k) or "") and (b.get(k) or ""):
+            out[k] = b[k]
+    return out
+
+def _graphql_video_meta_score(m: Dict[str, str]) -> int:
+    return (4 if (m.get("tweet_id") or "").strip() else 0) + (2 if (m.get("author") or "").strip() else 0) + (1 if (m.get("created_at") or "").strip() else 0)
+
+def _collect_video_key_to_tweet_meta_from_json_obj(obj) -> Dict[str, Dict[str, str]]:
+    out: Dict[str, Dict[str, str]] = {}
+    user_screen_by_id: Dict[str, str] = {}
+    # Pass 1: build user id -> @screen_name map from any user-like nodes.
+    for d in _iter_dicts(obj):
+        if not isinstance(d, dict):
+            continue
+        legacy_u = d.get("legacy")
+        if isinstance(legacy_u, dict):
+            sn = (legacy_u.get("screen_name") or "").strip()
+            if sn:
+                sn = sn if sn.startswith("@") else f"@{sn}"
+                uid = (d.get("rest_id") or d.get("id_str") or legacy_u.get("id_str") or "").strip()
+                if uid.isdigit() and uid not in user_screen_by_id:
+                    user_screen_by_id[uid] = sn
+
+    def walk(x, inherited_meta: Dict[str, str]) -> None:
+        if isinstance(x, dict):
+            local_meta = inherited_meta
+            node_meta = _tweet_meta_from_graphql_node(x, user_screen_by_id)
+            if node_meta:
+                local_meta = _merge_graphql_video_meta(node_meta, inherited_meta)
+
+            urls: List[str] = []
+            for v in x.values():
+                if isinstance(v, str) and "video.twimg.com/" in v:
+                    urls.append(v)
+            if urls and (local_meta.get("tweet_id") or "").strip().isdigit():
+                for u in urls:
+                    mk = normalize_media_key(canon_media_url(u) or "")
+                    if not mk:
+                        continue
+                    prev = out.get(mk, {}) or {}
+                    merged = _merge_graphql_video_meta(local_meta, prev)
+                    if _graphql_video_meta_score(merged) >= _graphql_video_meta_score(prev):
+                        out[mk] = merged
+
+            for v in x.values():
+                if isinstance(v, (dict, list)):
+                    walk(v, local_meta)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v, inherited_meta)
+
+    walk(obj, {})
+
+    # Fallback: broad per-node scan keeps compatibility with older behavior.
+    for d in _iter_dicts(obj):
+        if not isinstance(d, dict):
+            continue
+        meta = _tweet_meta_from_graphql_node(d, user_screen_by_id)
+        if not (meta.get("tweet_id") or "").strip().isdigit():
+            continue
+        urls: List[str] = []
+        for sd in _iter_dicts(d):
+            if not isinstance(sd, dict):
+                continue
+            for v in sd.values():
+                if isinstance(v, str) and "video.twimg.com/" in v:
+                    urls.append(v)
+        for u in urls:
+            mk = normalize_media_key(canon_media_url(u) or "")
+            if not mk:
+                continue
+            prev = out.get(mk, {}) or {}
+            merged = _merge_graphql_video_meta(meta, prev)
+            if _graphql_video_meta_score(merged) >= _graphql_video_meta_score(prev):
+                out[mk] = merged
+    return out
+
+def _tid_confidence(source: str) -> str:
+    s = (source or "").strip().lower()
+    if s == "graphql":
+        return "high"
+    if s in ("dom_article_video", "dom_status"):
+        return "medium"
+    if s:
+        return "low"
+    return ""
+
+def backfill_tweet_id_from_graphql_bodies(
+    cdp_meta_by_key: Dict[str, Dict[str, str]],
+    max_bodies: int = 2000,
+    quiet: bool = False,
+) -> int:
+    updated = 0
+    attempted = 0
+    try:
+        logs = driver.get_log("performance")
+    except Exception:
+        logs = []
+    req_ids: List[str] = []
+    for entry in logs:
+        try:
+            msg = json.loads(entry.get("message", "{}")).get("message", {})
+            params = msg.get("params", {}) or {}
+            method = msg.get("method", "")
+            rid = (params.get("requestId") or "").strip()
+            if not rid:
+                continue
+            if method == "Network.requestWillBeSent":
+                req = params.get("request", {}) or {}
+                u = str(req.get("url") or "")
+                if u:
+                    CDP_REQ_URL_BY_ID[rid] = u
+            elif method == "Network.responseReceived":
+                res = params.get("response", {}) or {}
+                u = str(res.get("url") or "")
+                if u:
+                    CDP_REQ_URL_BY_ID[rid] = u
+                CDP_RESP_MIME_BY_ID[rid] = str(res.get("mimeType") or "")
+            elif method == "Network.loadingFinished":
+                CDP_FINISHED_REQ_IDS.add(rid)
+        except Exception:
+            continue
+    for rid, u in list(CDP_REQ_URL_BY_ID.items()):
+        ul = (u or "").lower()
+        mime = (CDP_RESP_MIME_BY_ID.get(rid, "") or "").lower()
+        is_candidate = (
+            ("graphql" in ul)
+            or ("bookmarks" in ul)
+            or ("tweetresultbyrestid" in ul)
+            or ("timeline" in ul and "x.com/i/api" in ul)
+            or ("x.com/i/api/2/" in ul)
+        )
+        if is_candidate and (("json" in mime) or (rid in CDP_FINISHED_REQ_IDS)) and rid not in CDP_GRAPHQL_BODY_PARSED_REQ_IDS:
+            req_ids.append(rid)
+    req_ids = list(dict.fromkeys(req_ids))[-max(1, int(max_bodies)):]
+    for rid in req_ids:
+        try:
+            attempted += 1
+            body_obj = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": rid})
+            CDP_GRAPHQL_BODY_PARSED_REQ_IDS.add(rid)
+            body = (body_obj or {}).get("body", "")
+            if not body:
+                continue
+            if body.startswith(")]}'"):
+                body = body.split("\n", 1)[-1]
+            parsed = json.loads(body)
+            m = _collect_video_key_to_tweet_meta_from_json_obj(parsed)
+            for mk, meta in m.items():
+                tid = (meta.get("tweet_id") or "").strip()
+                author = (meta.get("author") or "").strip()
+                created_at = (meta.get("created_at") or "").strip()
+                prev = cdp_meta_by_key.get(mk, {}) or {}
+                if not (prev.get("tweet_id") or ""):
+                    cdp_meta_by_key[mk] = {
+                        "tweet_id": tid,
+                        "uploader_name": author or prev.get("uploader_name", ""),
+                        "upload_time": created_at or prev.get("upload_time", ""),
+                    }
+                    updated += 1
+                    CDP_TID_SOURCE_BY_MEDIA_KEY[mk] = "graphql"
+                elif author and not (prev.get("uploader_name") or ""):
+                    prev["uploader_name"] = author
+                    cdp_meta_by_key[mk] = prev
+                if created_at and not (cdp_meta_by_key.get(mk, {}) or {}).get("upload_time", ""):
+                    prev2 = cdp_meta_by_key.get(mk, {}) or {}
+                    prev2["upload_time"] = created_at
+                    cdp_meta_by_key[mk] = prev2
+                if mk and mk not in CDP_TID_BY_MEDIA_KEY:
+                    CDP_TID_BY_MEDIA_KEY[mk] = tid
+                    CDP_TID_SOURCE_BY_MEDIA_KEY[mk] = "graphql"
+        except Exception:
+            continue
+    if attempted > 0 and not quiet:
+        print(f"debug: [GQL_BACKFILL] attemptedBodies={attempted}, updated={updated}")
+    return updated
+
+def backfill_tweet_id_from_cdp_video_requests(cdp_meta_by_key: Dict[str, Dict[str, str]]) -> int:
+    """
+    Fallback mapper: use Network.request/response logs to associate video.twimg media_key
+    with nearby status/tweet id context (URL/referrer/documentURL/initiator).
+    """
+    updated = 0
+    seen_req_tid: Dict[str, str] = {}
+    seen_req_url: Dict[str, str] = {}
+    try:
+        logs = driver.get_log("performance")
+    except Exception:
+        logs = []
+
+    for entry in logs:
+        try:
+            msg = json.loads(entry.get("message", "{}")).get("message", {})
+            method = msg.get("method", "")
+            params = msg.get("params", {}) or {}
+            rid = (params.get("requestId") or "").strip()
+            if not rid:
+                continue
+            if method == "Network.requestWillBeSent":
+                req = params.get("request", {}) or {}
+                url = str(req.get("url") or "")
+                seen_req_url[rid] = url
+                tid = _extract_status_id_from_text(url)
+                if not tid:
+                    headers = req.get("headers", {}) or {}
+                    if isinstance(headers, dict):
+                        for hk in ("Referer", "referer", "Origin", "origin"):
+                            tid = _extract_status_id_from_text(str(headers.get(hk, "") or ""))
+                            if tid:
+                                break
+                if not tid:
+                    doc = str(params.get("documentURL") or "")
+                    tid = _extract_status_id_from_text(doc)
+                if not tid:
+                    init = params.get("initiator", {}) or {}
+                    if isinstance(init, dict):
+                        tid = _extract_status_id_from_text(str(init.get("url", "") or ""))
+                if not tid:
+                    tid = _extract_status_id_deep(params)
+                if tid:
+                    seen_req_tid[rid] = tid
+            elif method == "Network.responseReceived":
+                res = params.get("response", {}) or {}
+                u = str(res.get("url") or "")
+                if u:
+                    seen_req_url[rid] = u
+                if rid not in seen_req_tid:
+                    tid = _extract_status_id_deep(params)
+                    if tid:
+                        seen_req_tid[rid] = tid
+        except Exception:
+            continue
+
+    for rid, u in seen_req_url.items():
+        cu = canon_media_url(u)
+        mk = normalize_media_key(cu) or ""
+        if not mk:
+            continue
+        if "video.twimg.com/" not in cu:
+            continue
+        tid = (seen_req_tid.get(rid) or CDP_TID_BY_MEDIA_KEY.get(mk) or "").strip()
+        if not tid:
+            continue
+        prev = cdp_meta_by_key.get(mk, {}) or {}
+        if not (prev.get("tweet_id") or ""):
+            cdp_meta_by_key[mk] = {
+                "tweet_id": tid,
+                "uploader_name": prev.get("uploader_name", ""),
+                "upload_time": prev.get("upload_time", ""),
+            }
+            updated += 1
+            CDP_TID_BY_MEDIA_KEY[mk] = tid
+            CDP_TID_SOURCE_BY_MEDIA_KEY[mk] = "cdp_request_ctx"
+    if updated > 0:
+        print(f"debug: [CDP_REQ_BACKFILL] updated={updated}")
+    return updated
+
+def drain_cdp_media() -> List[str]:
+    return [x.get("url", "") for x in drain_cdp_media_with_meta() if x.get("url")]
 
 def update_cdp_seen_from_logs(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str]) -> int:
 # CDP drain → 고유 미디어키 집합/URL 맵 갱신. 반환: 이번 호출에서 새로 추가된 key 개수 
     _, added_keys = update_cdp_seen_from_logs_with_keys(cdp_seen_keys, cdp_url_by_key)
     return len(added_keys)
 
-def update_cdp_seen_from_logs_with_keys(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str]) -> Tuple[int, List[str]]:
+def update_cdp_seen_from_logs_with_keys(
+    cdp_seen_keys: set[str],
+    cdp_url_by_key: Dict[str, str],
+    cdp_meta_by_key: Dict[str, Dict[str, str]] | None = None,
+) -> Tuple[int, List[str]]:
 # CDP drain → 고유 미디어키 집합/URL 맵 갱신. 반환: (새로 추가된 key 개수, 새 key 목록)
-    new_urls = drain_cdp_media()
+    new_items = drain_cdp_media_with_meta()
     added_keys: List[str] = []
-    for u in new_urls:
+    for it in new_items:
+        u = it.get("url", "") or ""
+        tid = (it.get("tweet_id", "") or "").strip()
         mk = normalize_media_key(u)
         if not mk:
             continue
@@ -1205,6 +1855,19 @@ def update_cdp_seen_from_logs_with_keys(cdp_seen_keys: set[str], cdp_url_by_key:
             if mk not in cdp_url_by_key:
                 cdp_url_by_key[mk] = u
             added_keys.append(mk)
+        else:
+            # same key observed again: keep better-quality video variant URL.
+            prev = cdp_url_by_key.get(mk, "")
+            if _video_quality_score(u) > _video_quality_score(prev):
+                cdp_url_by_key[mk] = u
+        if cdp_meta_by_key is not None and tid:
+            prevm = cdp_meta_by_key.get(mk, {})
+            if not (prevm.get("tweet_id") or ""):
+                cdp_meta_by_key[mk] = {
+                    "tweet_id": tid,
+                    "uploader_name": prevm.get("uploader_name", "") if isinstance(prevm, dict) else "",
+                    "upload_time": prevm.get("upload_time", "") if isinstance(prevm, dict) else "",
+                }
     return len(added_keys), added_keys
 
 def flush_io_buffer() -> List[Dict[str, str]]:
@@ -1228,6 +1891,1044 @@ def flush_io_buffer() -> List[Dict[str, str]]:
         except Exception:
             continue
     return out
+
+def collect_visible_tweet_ids(viewport_pad: int = VIEWPORT_PAD) -> List[str]:
+    js = r"""
+const pad = arguments[0];
+const topY = window.scrollY - pad;
+const bottomY = window.scrollY + window.innerHeight + pad;
+function inRange(el) {
+  const r = el.getBoundingClientRect();
+  const y1 = window.scrollY + r.top;
+  const y2 = window.scrollY + r.bottom;
+  return (y2 >= topY && y1 <= bottomY);
+}
+const ids = [];
+const seen = new Set();
+const arts = document.querySelectorAll('article');
+for (const art of arts) {
+  if (!inRange(art)) continue;
+  let tid = '';
+  const links = art.querySelectorAll('a[href*="/status/"]');
+  for (const a of links) {
+    const href = a.getAttribute('href') || '';
+    const m = href.match(/\/status\/(\d+)/);
+    if (m) { tid = m[1]; break; }
+  }
+  if (!tid) {
+    const html = art.innerHTML || '';
+    const m2 = html.match(/\/status\/(\d+)/);
+    if (m2) tid = m2[1];
+  }
+  if (tid && !seen.has(tid)) {
+    seen.add(tid);
+    ids.push(tid);
+  }
+}
+return ids;
+"""
+    try:
+        out = driver.execute_script(js, viewport_pad) or []
+        return [str(x).strip() for x in out if str(x).strip().isdigit()]
+    except Exception:
+        return []
+
+def collect_visible_author_by_tweet_id(viewport_pad: int = VIEWPORT_PAD) -> Dict[str, str]:
+    js = r"""
+const pad = arguments[0];
+const topY = window.scrollY - pad;
+const bottomY = window.scrollY + window.innerHeight + pad;
+function inRange(el) {
+  const r = el.getBoundingClientRect();
+  const y1 = window.scrollY + r.top;
+  const y2 = window.scrollY + r.bottom;
+  return (y2 >= topY && y1 <= bottomY);
+}
+const out = {};
+const arts = document.querySelectorAll('article');
+for (const art of arts) {
+  if (!inRange(art)) continue;
+  let tid = '';
+  const links = art.querySelectorAll('a[href*="/status/"]');
+  for (const a of links) {
+    const href = a.getAttribute('href') || '';
+    const m = href.match(/\/status\/(\d+)/);
+    if (m) { tid = m[1]; break; }
+  }
+  if (!tid) continue;
+  let author = '';
+  const userNameBox = art.querySelector('[data-testid="User-Name"]');
+  if (userNameBox) {
+    const spans2 = userNameBox.querySelectorAll('span');
+    for (const s of spans2) {
+      const t = (s.textContent || '').trim();
+      if (t.startsWith('@')) { author = t; break; }
+    }
+  }
+  if (!author) {
+    const spans = art.querySelectorAll('span');
+    for (const s of spans) {
+      const t = (s.textContent || '').trim();
+      if (t.startsWith('@')) { author = t; break; }
+    }
+  }
+  if (tid && author && !out[tid]) out[tid] = author;
+}
+return out;
+"""
+    try:
+        m = driver.execute_script(js, viewport_pad) or {}
+        if isinstance(m, dict):
+            return {str(k): str(v) for k, v in m.items() if str(k).isdigit() and str(v).startswith("@")}
+    except Exception:
+        pass
+    return {}
+
+def collect_visible_time_by_tweet_id(viewport_pad: int = VIEWPORT_PAD) -> Dict[str, str]:
+    js = r"""
+const pad = arguments[0];
+const topY = window.scrollY - pad;
+const bottomY = window.scrollY + window.innerHeight + pad;
+function inRange(el) {
+  const r = el.getBoundingClientRect();
+  const y1 = window.scrollY + r.top;
+  const y2 = window.scrollY + r.bottom;
+  return (y2 >= topY && y1 <= bottomY);
+}
+const out = {};
+const arts = document.querySelectorAll('article');
+for (const art of arts) {
+  if (!inRange(art)) continue;
+  let tid = '';
+  const links = art.querySelectorAll('a[href*="/status/"]');
+  for (const a of links) {
+    const href = a.getAttribute('href') || '';
+    const m = href.match(/\/status\/(\d+)/);
+    if (m) { tid = m[1]; break; }
+  }
+  if (!tid) continue;
+  let dt = '';
+  const t = art.querySelector('time');
+  if (t && t.getAttribute('datetime')) dt = t.getAttribute('datetime');
+  if (tid && dt && !out[tid]) out[tid] = dt;
+}
+return out;
+"""
+    try:
+        m = driver.execute_script(js, viewport_pad) or {}
+        if isinstance(m, dict):
+            return {str(k): str(v) for k, v in m.items() if str(k).isdigit() and str(v).strip()}
+    except Exception:
+        pass
+    return {}
+
+def backfill_authors_for_video_entries(entries: List[Dict[str, str]], rounds: int = 36) -> int:
+    need = { (e.get("tweet_id") or "").strip() for e in entries if (e.get("tweet_id") or "").strip().isdigit() and not (e.get("uploader_name") or "").strip() }
+    if not need:
+        return 0
+    y0, y1 = ensure_repair_bottom_start("AUTHOR_BACKFILL")
+    print(f"message: AUTHOR_BACKFILL start yOffset {y0} -> {y1}")
+    found: Dict[str, str] = {}
+    vh = _get_vh()
+    # Use SAFE-like upward coverage so author-only pass scans the whole region.
+    step = max(220, min(UP_STEP_PX, int(vh * (1.0 - SAFE_OVERLAP_RATIO))))
+    max_steps = _dynamic_upward_scan_limit(y1, step, rounds=rounds, margin_steps=120)
+    print(f"message: AUTHOR_BACKFILL scan step={step}, maxSteps={max_steps}")
+    i = 0
+    with tqdm(total=0, desc="AuthorBackfill", unit="step", dynamic_ncols=True, leave=True) as pbar:
+        while True:
+            i += 1
+            m = collect_visible_author_by_tweet_id()
+            for tid in list(need):
+                if tid in m:
+                    found[tid] = m[tid]
+                    need.discard(tid)
+            y_now = _get_scroll_y()
+            pbar.update(1)
+            pbar.set_postfix({"y": y_now, "found": len(found), "remain": len(need)}, refresh=False)
+            if not need or y_now <= 2:
+                break
+            driver.execute_script("window.scrollBy(0, arguments[0]);", -int(step))
+            time.sleep(max(0.08, UP_DELAY_S))
+            if i >= max_steps:
+                break
+
+    updated = 0
+    for e in entries:
+        tid = (e.get("tweet_id") or "").strip()
+        if tid in found and not (e.get("uploader_name") or "").strip():
+            e["uploader_name"] = found[tid]
+            updated += 1
+    return updated
+
+def backfill_authors_in_video_rows(rows: List[Dict[str, str]], rounds: int = 48) -> int:
+    entries = []
+    for r in rows:
+        entries.append({
+            "tweet_id": (r.get("tweet_id") or "").strip(),
+            "uploader_name": (r.get("author") or "").strip(),
+        })
+    updated = backfill_authors_for_video_entries(entries, rounds=rounds)
+    if updated <= 0:
+        return 0
+    changed = 0
+    for i, r in enumerate(rows):
+        new_author = (entries[i].get("uploader_name") or "").strip()
+        if new_author and not (r.get("author") or "").strip():
+            r["author"] = new_author
+            changed += 1
+    return changed
+
+def backfill_created_at_in_video_rows(rows: List[Dict[str, str]], rounds: int = 60) -> int:
+    need = { (r.get("tweet_id") or "").strip() for r in rows if (r.get("tweet_id") or "").strip().isdigit() and not (r.get("created_at") or "").strip() }
+    if not need:
+        return 0
+    y0, y1 = ensure_repair_bottom_start("CREATEDAT_BACKFILL")
+    print(f"message: CREATEDAT_BACKFILL start yOffset {y0} -> {y1}")
+    found: Dict[str, str] = {}
+    vh = _get_vh()
+    step = max(220, min(UP_STEP_PX, int(vh * (1.0 - SAFE_OVERLAP_RATIO))))
+    max_steps = _dynamic_upward_scan_limit(y1, step, rounds=rounds, margin_steps=120)
+    print(f"message: CREATEDAT_BACKFILL scan step={step}, maxSteps={max_steps}")
+    i = 0
+    with tqdm(total=0, desc="CreatedAtBackfill", unit="step", dynamic_ncols=True, leave=True) as pbar:
+        while True:
+            i += 1
+            m = collect_visible_time_by_tweet_id()
+            for tid in list(need):
+                if tid in m:
+                    found[tid] = m[tid]
+                    need.discard(tid)
+            y_now = _get_scroll_y()
+            pbar.update(1)
+            pbar.set_postfix({"y": y_now, "found": len(found), "remain": len(need)}, refresh=False)
+            if not need or y_now <= 2:
+                break
+            driver.execute_script("window.scrollBy(0, arguments[0]);", -int(step))
+            time.sleep(max(0.08, UP_DELAY_S))
+            if i >= max_steps:
+                break
+    updated = 0
+    for r in rows:
+        tid = (r.get("tweet_id") or "").strip()
+        if tid in found and not (r.get("created_at") or "").strip():
+            r["created_at"] = found[tid]
+            r["created_at_norm"] = normalize_time(r["created_at"])
+            updated += 1
+    return updated
+
+def warmup_scroll_for_repair(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str], cdp_meta_by_key: Dict[str, Dict[str, str]], cycles: int = 40) -> None:
+    vh = _get_vh()
+    step_px = max(220, min(DOWN_STEP_PX, int(0.70 * vh)))
+    print(f"message: REPAIR warmup start ({cycles} down + {cycles} up), step={step_px}")
+    with tqdm(total=cycles, desc="RepairWarmup-Down", unit="step", dynamic_ncols=True, leave=True) as pbar_down:
+        for _ in range(cycles):
+            driver.execute_script("window.scrollBy(0, arguments[0]);", step_px)
+            time.sleep(DOWN_DELAY_S)
+            new_added, _ = update_cdp_seen_from_logs_with_keys(cdp_seen_keys, cdp_url_by_key, cdp_meta_by_key=cdp_meta_by_key)
+            pbar_down.update(1)
+            pbar_down.set_postfix({
+                "cdpNew": new_added,
+                "cdpKeys": len(cdp_seen_keys),
+                "y": _get_scroll_y(),
+            }, refresh=False)
+    with tqdm(total=cycles, desc="RepairWarmup-Up", unit="step", dynamic_ncols=True, leave=True) as pbar_up:
+        for _ in range(cycles):
+            driver.execute_script("window.scrollBy(0, arguments[0]);", -step_px)
+            time.sleep(DOWN_DELAY_S)
+            new_added, _ = update_cdp_seen_from_logs_with_keys(cdp_seen_keys, cdp_url_by_key, cdp_meta_by_key=cdp_meta_by_key)
+            pbar_up.update(1)
+            pbar_up.set_postfix({
+                "cdpNew": new_added,
+                "cdpKeys": len(cdp_seen_keys),
+                "y": _get_scroll_y(),
+            }, refresh=False)
+
+def warmup_scroll_for_repair_full(
+    cdp_seen_keys: set[str],
+    cdp_url_by_key: Dict[str, str],
+    cdp_meta_by_key: Dict[str, Dict[str, str]],
+    return_to_top: bool = True,
+) -> None:
+    vh = _get_vh()
+    step_px = max(220, min(DOWN_STEP_PX, int(0.70 * vh)))
+    print(f"message: REPAIR warmup FULL start, step={step_px}")
+
+    # Use the same descent engine as normal FULL mode to avoid early-stop mismatches.
+    desc_meta_dummy: Dict[str, Dict[str, str]] = {}
+    _ = full_descent(
+        cdp_seen_keys,
+        cdp_url_by_key,
+        desc_meta_dummy,
+        stop_when_seen_keys=None,
+        cdp_meta_by_key=cdp_meta_by_key,
+    )
+
+    if not return_to_top:
+        return
+
+    # up to top
+    with tqdm(total=0, desc="RepairWarmup-UpFull", unit="step", dynamic_ncols=True, leave=True) as pbar_up:
+        while True:
+            y_prev = _get_scroll_y()
+            if y_prev <= 2:
+                break
+            driver.execute_script("window.scrollBy(0, arguments[0]);", -step_px)
+            time.sleep(DOWN_DELAY_S)
+            new_added, _ = update_cdp_seen_from_logs_with_keys(cdp_seen_keys, cdp_url_by_key, cdp_meta_by_key=cdp_meta_by_key)
+            y = _get_scroll_y()
+            pbar_up.update(1)
+            pbar_up.set_postfix({"cdpNew": new_added, "cdpKeys": len(cdp_seen_keys), "y": y}, refresh=False)
+            if y >= y_prev - 1 and y <= 2:
+                break
+
+def collect_visible_status_url_by_video_key(viewport_pad: int = VIEWPORT_PAD) -> Dict[str, str]:
+    js = r"""
+const pad = arguments[0];
+const topY = window.scrollY - pad;
+const bottomY = window.scrollY + window.innerHeight + pad;
+function inRange(el) {
+  const r = el.getBoundingClientRect();
+  const y1 = window.scrollY + r.top;
+  const y2 = window.scrollY + r.bottom;
+  return (y2 >= topY && y1 <= bottomY);
+}
+const out = {};
+const arts = document.querySelectorAll('article');
+for (const art of arts) {
+  if (!inRange(art)) continue;
+  let statusUrl = '';
+  const links = art.querySelectorAll('a[href*="/status/"]');
+  for (const a of links) {
+    const href = a.getAttribute('href') || '';
+    const m = href.match(/\/status\/\d+/);
+    if (m) { statusUrl = href; break; }
+  }
+  if (!statusUrl) continue;
+  const vids = art.querySelectorAll('video[src], video source[src]');
+  for (const vd of vids) {
+    const src = vd.getAttribute('src') || '';
+    if (!src) continue;
+    out[src] = statusUrl;
+  }
+}
+return out;
+"""
+    ret: Dict[str, str] = {}
+    try:
+        m = driver.execute_script(js, viewport_pad) or {}
+        if isinstance(m, dict):
+            for u, s in m.items():
+                cu = canon_media_url(str(u or ""))
+                ret[cu] = str(s or "")
+    except Exception:
+        return {}
+    return ret
+
+def collect_visible_status_by_media_key(viewport_pad: int = VIEWPORT_PAD) -> Dict[str, str]:
+    by_url = collect_visible_status_url_by_video_key(viewport_pad)
+    out: Dict[str, str] = {}
+    for u, s in by_url.items():
+        mk = normalize_media_key(u) or ""
+        if not mk or not s:
+            continue
+        if mk not in out:
+            out[mk] = s
+    return out
+
+def collect_visible_video_key_to_tweet_id(viewport_pad: int = VIEWPORT_PAD) -> Dict[str, str]:
+    js = r"""
+const pad = arguments[0];
+const topY = window.scrollY - pad;
+const bottomY = window.scrollY + window.innerHeight + pad;
+function inRange(el) {
+  const r = el.getBoundingClientRect();
+  const y1 = window.scrollY + r.top;
+  const y2 = window.scrollY + r.bottom;
+  return (y2 >= topY && y1 <= bottomY);
+}
+const out = {};
+const arts = document.querySelectorAll('article');
+for (const art of arts) {
+  if (!inRange(art)) continue;
+  let tid = '';
+  const links = art.querySelectorAll('a[href*="/status/"]');
+  for (const a of links) {
+    const href = a.getAttribute('href') || '';
+    const m = href.match(/\/status\/(\d+)/);
+    if (m) { tid = m[1]; break; }
+  }
+  if (!tid) {
+    const html = art.innerHTML || '';
+    const m2 = html.match(/\/status\/(\d+)/);
+    if (m2) tid = m2[1];
+  }
+  if (!tid) continue;
+  const vids = art.querySelectorAll('video, video source');
+  for (const vd of vids) {
+    const cands = [];
+    const src = vd.getAttribute('src') || '';
+    if (src) cands.push(src);
+    const poster = vd.getAttribute('poster') || '';
+    if (poster) cands.push(poster);
+    const cs = vd.currentSrc || '';
+    if (cs) cands.push(cs);
+    for (const u of cands) out[u] = tid;
+  }
+}
+return out;
+"""
+    out: Dict[str, str] = {}
+    try:
+        raw = driver.execute_script(js, viewport_pad) or {}
+        if not isinstance(raw, dict):
+            return out
+        for u, tid in raw.items():
+            cu = canon_media_url(str(u or ""))
+            mk = normalize_media_key(cu) or ""
+            t = str(tid or "").strip()
+            if mk and t.isdigit():
+                out[mk] = t
+    except Exception:
+        return {}
+    return out
+
+def collect_visible_video_key_to_meta(viewport_pad: int = VIEWPORT_PAD) -> Dict[str, Dict[str, str]]:
+    js = r"""
+const pad = arguments[0];
+const topY = window.scrollY - pad;
+const bottomY = window.scrollY + window.innerHeight + pad;
+function inRange(el) {
+  const r = el.getBoundingClientRect();
+  const y1 = window.scrollY + r.top;
+  const y2 = window.scrollY + r.bottom;
+  return (y2 >= topY && y1 <= bottomY);
+}
+const out = {};
+const arts = document.querySelectorAll('article');
+for (const art of arts) {
+  if (!inRange(art)) continue;
+  let tid = '';
+  const links = art.querySelectorAll('a[href*="/status/"]');
+  for (const a of links) {
+    const href = a.getAttribute('href') || '';
+    const m = href.match(/\/status\/(\d+)/);
+    if (m) { tid = m[1]; break; }
+  }
+  let author = '';
+  const userNameBox = art.querySelector('[data-testid="User-Name"]');
+  if (userNameBox) {
+    const spans2 = userNameBox.querySelectorAll('span');
+    for (const s of spans2) {
+      const t = (s.textContent || '').trim();
+      if (t.startsWith('@')) { author = t; break; }
+    }
+  }
+  if (!author) {
+    const spans = art.querySelectorAll('span');
+    for (const s of spans) {
+      const t = (s.textContent || '').trim();
+      if (t.startsWith('@')) { author = t; break; }
+    }
+  }
+  let dt = '';
+  const tm = art.querySelector('time');
+  if (tm && tm.getAttribute('datetime')) dt = tm.getAttribute('datetime');
+
+  const vids = art.querySelectorAll('video, video source');
+  for (const vd of vids) {
+    const cands = [];
+    const src = vd.getAttribute('src') || '';
+    if (src) cands.push(src);
+    const poster = vd.getAttribute('poster') || '';
+    if (poster) cands.push(poster);
+    const cs = vd.currentSrc || '';
+    if (cs) cands.push(cs);
+    for (const u of cands) {
+      out[u] = { tweet_id: tid || '', author: author || '', created_at: dt || '' };
+    }
+  }
+}
+return out;
+"""
+    out: Dict[str, Dict[str, str]] = {}
+    try:
+        raw = driver.execute_script(js, viewport_pad) or {}
+        if not isinstance(raw, dict):
+            return out
+        for u, m in raw.items():
+            cu = canon_media_url(str(u or ""))
+            mk = normalize_media_key(cu) or ""
+            if not mk:
+                continue
+            md = m if isinstance(m, dict) else {}
+            out[mk] = {
+                "tweet_id": str(md.get("tweet_id", "") or "").strip(),
+                "author": str(md.get("author", "") or "").strip(),
+                "created_at": str(md.get("created_at", "") or "").strip(),
+            }
+    except Exception:
+        return {}
+    return out
+
+def _media_key_aliases(mk: str) -> List[str]:
+    m = re.match(r"^(ext_tw_video|amplify_video)_(\d+)$", (mk or "").strip())
+    if not m:
+        return [mk] if mk else []
+    num = m.group(2)
+    return [f"ext_tw_video_{num}", f"amplify_video_{num}"]
+
+def _media_numeric_id(mk: str) -> str:
+    m = re.match(r"^(ext_tw_video|amplify_video)_(\d+)$", (mk or "").strip())
+    return m.group(2) if m else ""
+
+def _lookup_meta_by_video_key_alias(
+    mk: str,
+    meta_by_key: Dict[str, Dict[str, str]] | None,
+) -> Tuple[Dict[str, str], str]:
+    """Find video meta by exact key, ext/amplify alias, then numeric id."""
+    if not meta_by_key:
+        return {}, ""
+    candidates: List[str] = []
+    for ak in _media_key_aliases(mk):
+        if ak and ak not in candidates:
+            candidates.append(ak)
+    if mk and mk not in candidates:
+        candidates.insert(0, mk)
+
+    best: Dict[str, str] = {}
+    best_key = ""
+    for ck in candidates:
+        cm = meta_by_key.get(ck, {}) or {}
+        if _meta_score(cm) > _meta_score(best):
+            best = cm
+            best_key = ck
+    if best:
+        return best, best_key
+
+    kid = _media_numeric_id(mk)
+    if not kid:
+        return {}, ""
+    for ck, cm in meta_by_key.items():
+        if _media_numeric_id(ck) != kid:
+            continue
+        if _meta_score(cm or {}) > _meta_score(best):
+            best = cm or {}
+            best_key = ck
+    return best, best_key
+
+def _source_for_video_key_alias(mk: str, matched_key: str = "") -> str:
+    for ck in [matched_key] + _media_key_aliases(mk):
+        if ck and CDP_TID_SOURCE_BY_MEDIA_KEY.get(ck):
+            return CDP_TID_SOURCE_BY_MEDIA_KEY.get(ck, "")
+    kid = _media_numeric_id(mk)
+    if kid:
+        for ck, src in CDP_TID_SOURCE_BY_MEDIA_KEY.items():
+            if src and _media_numeric_id(ck) == kid:
+                return src
+    return ""
+
+def collect_visible_tid_by_keyid_probe(key_ids: List[str], viewport_pad: int = VIEWPORT_PAD) -> Dict[str, str]:
+    ids = [str(x).strip() for x in key_ids if str(x).strip().isdigit()]
+    if not ids:
+        return {}
+    js = r"""
+const ids = arguments[0] || [];
+const pad = arguments[1];
+const topY = window.scrollY - pad;
+const bottomY = window.scrollY + window.innerHeight + pad;
+function inRange(el) {
+  const r = el.getBoundingClientRect();
+  const y1 = window.scrollY + r.top;
+  const y2 = window.scrollY + r.bottom;
+  return (y2 >= topY && y1 <= bottomY);
+}
+const out = {};
+const arts = document.querySelectorAll('article');
+for (const art of arts) {
+  if (!inRange(art)) continue;
+  let tid = '';
+  const links = art.querySelectorAll('a[href*="/status/"]');
+  for (const a of links) {
+    const href = a.getAttribute('href') || '';
+    const m = href.match(/\/status\/(\d+)/);
+    if (m) { tid = m[1]; break; }
+  }
+  if (!tid) continue;
+  // Strict mode: key id must be observed in VIDEO-related URLs inside the same article.
+  const cands = [];
+  const vids = art.querySelectorAll('video, video source');
+  for (const vd of vids) {
+    const src = vd.getAttribute('src') || '';
+    if (src) cands.push(src);
+    const poster = vd.getAttribute('poster') || '';
+    if (poster) cands.push(poster);
+    const cs = vd.currentSrc || '';
+    if (cs) cands.push(cs);
+  }
+  // fallback: parse direct video.twimg.com links inside anchors (still article-local)
+  const links2 = art.querySelectorAll('a[href*="video.twimg.com/"]');
+  for (const a of links2) {
+    const href = a.getAttribute('href') || '';
+    if (href) cands.push(href);
+  }
+  for (const id of ids) {
+    if (out[id]) continue;
+    let hit = false;
+    for (const u of cands) {
+      if (!u) continue;
+      if (u.includes('/amplify_video/' + id + '/') || u.includes('/ext_tw_video/' + id + '/')) {
+        hit = true; break;
+      }
+    }
+    if (hit) out[id] = tid;
+  }
+}
+return out;
+"""
+    try:
+        out = driver.execute_script(js, ids, viewport_pad) or {}
+        if isinstance(out, dict):
+            return {str(k): str(v) for k, v in out.items() if str(v).isdigit()}
+    except Exception:
+        pass
+    return {}
+
+def backfill_cdp_tweet_id_from_visible_context(new_keys: List[str], cdp_meta_by_key: Dict[str, Dict[str, str]]) -> int:
+    if not new_keys:
+        return 0
+    key_tid_map = collect_visible_video_key_to_tweet_id()
+    updated = 0
+    for mk in new_keys:
+        tid = key_tid_map.get(mk, "")
+        if not tid:
+            for ak in _media_key_aliases(mk):
+                tid = key_tid_map.get(ak, "")
+                if tid:
+                    break
+        if not tid:
+            continue
+        prev = cdp_meta_by_key.get(mk, {}) or {}
+        if not (prev.get("tweet_id") or ""):
+            cdp_meta_by_key[mk] = {
+                "tweet_id": tid,
+                "uploader_name": prev.get("uploader_name", ""),
+                "upload_time": prev.get("upload_time", ""),
+            }
+            updated += 1
+            CDP_TID_SOURCE_BY_MEDIA_KEY[mk] = "dom_article_video"
+    if updated > 0:
+        return updated
+
+    tids = collect_visible_tweet_ids()
+    if len(tids) != 1:
+        return 0
+    tid = tids[0]
+    for mk in new_keys:
+        prev = cdp_meta_by_key.get(mk, {}) or {}
+        if not (prev.get("tweet_id") or ""):
+            cdp_meta_by_key[mk] = {
+                "tweet_id": tid,
+                "uploader_name": prev.get("uploader_name", ""),
+                "upload_time": prev.get("upload_time", ""),
+            }
+            updated += 1
+            CDP_TID_SOURCE_BY_MEDIA_KEY[mk] = "dom_status"
+    return updated
+
+def repair_video_items_meta_focus(items_path: str, rounds: int = 16) -> int:
+    rows = read_local_items_ndjson(items_path)
+    by_key: Dict[str, Dict[str, str]] = {}
+    for r in rows:
+        mk = (r.get("media_key") or "").strip() or (normalize_media_key(r.get("url", "") or "") or "")
+        if mk:
+            r["media_key"] = mk
+            by_key[mk] = r
+    targets = {mk for mk, r in by_key.items() if _row_missing_video_meta(r)}
+    if not targets:
+        return 0
+
+    updated = 0
+    vh = _get_vh()
+    step = max(260, int(vh * 0.55))
+    ensure_bottom_start("RepairFocus")
+    idle = 0
+    max_steps = max(4000, rounds * 40)
+    with tqdm(total=0, desc="RepairFocus", unit="step", dynamic_ncols=True, leave=True) as pbar:
+        for _ in range(max_steps):
+            # supplemental mapping: strict key-id + article video->tid + status-url parse
+            mapping_by_key = collect_visible_status_by_media_key()
+            key_tid_map = collect_visible_video_key_to_tweet_id()
+            probe = collect_visible_tid_by_keyid_probe([_media_numeric_id(k) for k in targets if _media_numeric_id(k)])
+            step_updated = 0
+            for mk in list(targets):
+                row = by_key.get(mk)
+                if not row:
+                    continue
+                tid = ""
+                for ak in _media_key_aliases(mk):
+                    if not tid:
+                        status = mapping_by_key.get(ak, "")
+                        tid = _extract_status_id_from_text(status)
+                    if not tid:
+                        tid = key_tid_map.get(ak, "")
+                    if tid:
+                        break
+                if not tid:
+                    kid = _media_numeric_id(mk)
+                    if kid:
+                        tid = probe.get(kid, "")
+                if tid and (row.get("tweet_id", "") or "") != tid:
+                    row["tweet_id"] = tid
+                    row["tid_source"] = "focus_mix"
+                    row["tid_confidence"] = _tid_confidence("dom_status")
+                    updated += 1
+                    step_updated += 1
+                if not _row_missing_video_meta(row):
+                    targets.discard(mk)
+            y_now = _get_scroll_y()
+            pbar.update(1)
+            pbar.set_postfix({"y": y_now, "unresolved": len(targets), "updated": updated}, refresh=False)
+            if not targets:
+                break
+            if step_updated == 0:
+                idle += 1
+            else:
+                idle = 0
+            if y_now <= 2 and idle >= 6:
+                break
+            driver.execute_script("window.scrollBy(0, arguments[0]);", -int(step))
+            time.sleep(max(0.10, UP_DELAY_S))
+
+    _rewrite_video_items_ndjson(items_path, list(by_key.values()))
+    return updated
+
+def repair_video_items_meta_strict(items_path: str, rounds: int = 24) -> int:
+    rows = read_local_items_ndjson(items_path)
+    by_key: Dict[str, Dict[str, str]] = {}
+    for r in rows:
+        mk = (r.get("media_key") or "").strip() or (normalize_media_key(r.get("url", "") or "") or "")
+        if mk:
+            r["media_key"] = mk
+            by_key[mk] = r
+    unresolved = {mk for mk, r in by_key.items() if _row_missing_video_meta(r)}
+    if not unresolved:
+        return 0
+
+    vh = _get_vh()
+    step = max(220, int(vh * 0.50))
+    updated = 0
+    ensure_bottom_start("RepairStrict")
+    key_ids = {mk: _media_numeric_id(mk) for mk in unresolved}
+    idle = 0
+    max_steps = max(4000, rounds * 40)
+    with tqdm(total=0, desc="RepairStrict", unit="step", dynamic_ncols=True, leave=True) as pbar:
+        for _ in range(max_steps):
+            probe = collect_visible_tid_by_keyid_probe(list(key_ids.values()))
+            step_updated = 0
+            for mk in list(unresolved):
+                kid = key_ids.get(mk, "")
+                tid = probe.get(kid, "")
+                if not tid:
+                    continue
+                row = by_key.get(mk)
+                if not row:
+                    continue
+                # Strict repair never overrides an existing tweet_id to avoid false-positive corruption.
+                if (row.get("tweet_id", "") or ""):
+                    if not _row_missing_video_meta(row):
+                        unresolved.discard(mk)
+                    continue
+                if (row.get("tweet_id", "") or "") != tid:
+                    row["tweet_id"] = tid
+                    updated += 1
+                    step_updated += 1
+                if not _row_missing_video_meta(row):
+                    unresolved.discard(mk)
+            y_now = _get_scroll_y()
+            pbar.update(1)
+            pbar.set_postfix({"y": y_now, "unresolved": len(unresolved), "updated": updated}, refresh=False)
+            if not unresolved:
+                break
+            if step_updated == 0:
+                idle += 1
+            else:
+                idle = 0
+            if y_now <= 2 and idle >= 6:
+                break
+            driver.execute_script("window.scrollBy(0, arguments[0]);", -int(step))
+            time.sleep(max(0.08, UP_DELAY_S))
+    _rewrite_video_items_ndjson(items_path, list(by_key.values()))
+    return updated
+
+def _collect_repair_video_dom_signals(ids: List[str], rounds: int = 3) -> Tuple[
+    Dict[str, str],
+    Dict[str, str],
+    Dict[str, str],
+    Dict[str, Dict[str, str]],
+    Dict[str, str],
+    Dict[str, str],
+]:
+    probe_all: Dict[str, str] = {}
+    key_tid_all: Dict[str, str] = {}
+    status_all: Dict[str, str] = {}
+    key_meta_all: Dict[str, Dict[str, str]] = {}
+    auth_all: Dict[str, str] = {}
+    time_all: Dict[str, str] = {}
+    for i in range(max(1, rounds)):
+        probe_all.update({k: v for k, v in collect_visible_tid_by_keyid_probe(ids).items() if v})
+        key_tid_all.update({k: v for k, v in collect_visible_video_key_to_tweet_id().items() if v})
+        status_all.update({k: v for k, v in collect_visible_status_by_media_key().items() if v})
+        for k, v in collect_visible_video_key_to_meta().items():
+            prev = key_meta_all.get(k, {}) or {}
+            key_meta_all[k] = pick_better_meta(
+                {
+                    "tweet_id": prev.get("tweet_id", ""),
+                    "uploader_name": prev.get("author", ""),
+                    "upload_time": prev.get("created_at", ""),
+                },
+                {
+                    "tweet_id": v.get("tweet_id", ""),
+                    "uploader_name": v.get("author", ""),
+                    "upload_time": v.get("created_at", ""),
+                },
+            )
+            key_meta_all[k] = {
+                "tweet_id": key_meta_all[k].get("tweet_id", ""),
+                "author": key_meta_all[k].get("uploader_name", ""),
+                "created_at": key_meta_all[k].get("upload_time", ""),
+            }
+        auth_all.update({k: v for k, v in collect_visible_author_by_tweet_id().items() if v})
+        time_all.update({k: v for k, v in collect_visible_time_by_tweet_id().items() if v})
+        if i < rounds - 1:
+            time.sleep(max(0.12, UP_DELAY_S * 2))
+    return probe_all, key_tid_all, status_all, key_meta_all, auth_all, time_all
+
+def backfill_video_tid_by_keyid_sweep(
+    rows_by_key: Dict[str, Dict[str, str]],
+    max_steps: int = 2400,
+    assume_at_bottom: bool = False,
+) -> int:
+    unresolved = {mk for mk, r in rows_by_key.items() if _row_missing_video_meta(r)}
+    if not unresolved:
+        return 0
+    key_ids = {mk: _media_numeric_id(mk) for mk in unresolved}
+    if not assume_at_bottom:
+        y0, y1 = ensure_bottom_start("TID_SWEEP")
+        print(f"message: TID_SWEEP start yOffset {y0} -> {y1}, unresolved={len(unresolved)}")
+    else:
+        y0, y1 = ensure_bottom_start("TID_SWEEP")
+        print(f"message: TID_SWEEP start-from-bottom unresolved={len(unresolved)}, yOffset={y1}")
+    vh = _get_vh()
+    step = max(220, min(UP_STEP_PX, int(vh * (1.0 - SAFE_OVERLAP_RATIO))))
+    updated = 0
+    author_updated = 0
+    created_updated = 0
+    no_progress_seq = 0
+    with tqdm(total=0, desc="RepairTidSweep", unit="step", dynamic_ncols=True, leave=True) as pbar:
+        for _ in range(max_steps):
+            ids = [kid for mk, kid in key_ids.items() if mk in unresolved and kid]
+            if not ids:
+                break
+            probe, key_tid_map, status_by_key, key_meta_map, vis_auth, vis_time = _collect_repair_video_dom_signals(ids, rounds=3)
+            hit = 0
+            source_signal = 0
+            for mk in list(unresolved):
+                kid = key_ids.get(mk, "")
+                if not kid:
+                    continue
+                tid = probe.get(kid, "")
+                if not tid:
+                    for ak in _media_key_aliases(mk):
+                        tid = key_tid_map.get(ak, "")
+                        if not tid:
+                            tid = _extract_status_id_from_text(status_by_key.get(ak, ""))
+                        if tid:
+                            break
+                if tid:
+                    source_signal += 1
+                if not tid:
+                    continue
+                row = rows_by_key.get(mk)
+                if not row:
+                    continue
+                if not (row.get("tweet_id", "") or "").strip():
+                    row["tweet_id"] = tid
+                    row["tid_source"] = "dom_status"
+                    row["tid_confidence"] = _tid_confidence("dom_status")
+                    updated += 1
+                    hit += 1
+                tid_now = (row.get("tweet_id", "") or "").strip()
+                if tid_now:
+                    if not (row.get("author", "") or "").strip():
+                        for ak in _media_key_aliases(mk):
+                            a2 = (key_meta_map.get(ak, {}) or {}).get("author", "")
+                            if a2:
+                                row["author"] = a2
+                                author_updated += 1
+                                break
+                    if not (row.get("author", "") or "").strip():
+                        a = vis_auth.get(tid_now, "")
+                        if a:
+                            row["author"] = a
+                            author_updated += 1
+                    if not (row.get("created_at", "") or "").strip():
+                        for ak in _media_key_aliases(mk):
+                            t2 = (key_meta_map.get(ak, {}) or {}).get("created_at", "")
+                            if t2:
+                                row["created_at"] = t2
+                                row["created_at_norm"] = normalize_time(t2)
+                                created_updated += 1
+                                break
+                    if not (row.get("created_at", "") or "").strip():
+                        t = vis_time.get(tid_now, "")
+                        if t:
+                            row["created_at"] = t
+                            row["created_at_norm"] = normalize_time(t)
+                            created_updated += 1
+                if not _row_missing_video_meta(row):
+                    unresolved.discard(mk)
+            y_now = _get_scroll_y()
+            if hit == 0 and source_signal == 0:
+                no_progress_seq += 1
+            else:
+                no_progress_seq = 0
+            pbar.update(1)
+            pbar.set_postfix(
+                {
+                    "y": y_now,
+                    "hit": hit,
+                    "sig": source_signal,
+                    "idle": no_progress_seq,
+                    "tid": updated,
+                    "auth": author_updated,
+                    "time": created_updated,
+                    "unresolved": len(unresolved),
+                },
+                refresh=False,
+            )
+            if not unresolved:
+                break
+            if y_now <= 2 and no_progress_seq >= 8:
+                break
+            driver.execute_script("window.scrollBy(0, arguments[0]);", -int(step))
+            time.sleep(max(0.08, UP_DELAY_S))
+    if author_updated > 0 or created_updated > 0:
+        print(f"message: TID_SWEEP meta-updated author={author_updated}, createdAt={created_updated}")
+    return updated
+
+def _meta_score(it: Dict[str, str]) -> int:
+    s = 0
+    if (it.get("tweet_id") or "").strip():
+        s += 4
+    if (it.get("uploader_name") or "").strip():
+        s += 2
+    if (it.get("upload_time") or "").strip():
+        s += 1
+    return s
+
+def _meta_core_ready(meta: Dict[str, str] | None) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    tid = (meta.get("tweet_id") or "").strip()
+    author = (meta.get("uploader_name") or meta.get("author") or "").strip()
+    ctime = (meta.get("upload_time") or meta.get("created_at") or "").strip()
+    return bool(tid and author and ctime)
+
+def _count_ready_meta_for_keys(
+    keys: set[str],
+    primary_meta: Dict[str, Dict[str, str]] | None,
+    secondary_meta: Dict[str, Dict[str, str]] | None = None,
+) -> int:
+    p = primary_meta or {}
+    s = secondary_meta or {}
+    ready = 0
+    for k in keys:
+        m1 = p.get(k, {}) if isinstance(p, dict) else {}
+        m2 = s.get(k, {}) if isinstance(s, dict) else {}
+        merged = pick_better_meta(m1, m2)
+        if _meta_core_ready(merged):
+            ready += 1
+    return ready
+
+def pick_better_meta(a: Dict[str, str] | None, b: Dict[str, str] | None) -> Dict[str, str]:
+    aa = a or {}
+    bb = b or {}
+    if _meta_score(bb) > _meta_score(aa):
+        base = dict(bb)
+        other = aa
+    else:
+        base = dict(aa)
+        other = bb
+    for fld in ("uploader_name", "upload_time", "tweet_id"):
+        if not (base.get(fld) or "") and (other.get(fld) or ""):
+            base[fld] = other.get(fld) or ""
+    return {
+        "uploader_name": base.get("uploader_name", "") or "",
+        "upload_time": base.get("upload_time", "") or "",
+        "tweet_id": base.get("tweet_id", "") or "",
+    }
+
+def enrich_entries_with_dom_meta(entries: List[Dict[str, str]], viewport_pad: int = VIEWPORT_PAD) -> int:
+    """
+    One-shot meta enrichment pass.
+    Re-snap DOM + IO buffer and fill missing uploader/time/tweet_id for existing entries by media_key.
+    """
+    updated = 0
+    try:
+        io_items = flush_io_buffer()
+    except Exception:
+        io_items = []
+    try:
+        dom_raw = driver.execute_script(JS_COLLECT_SNIPPET, viewport_pad) or []
+    except Exception:
+        dom_raw = []
+
+    dom_items: List[Dict[str, str]] = []
+    for d in dom_raw:
+        try:
+            dom_items.append({
+                "url": canon_media_url(d.get("url") or ""),
+                "uploader_name": d.get("uploader_name") or "",
+                "upload_time": d.get("upload_time") or "",
+                "tweet_id": d.get("tweet_id") or "",
+            })
+        except Exception:
+            continue
+
+    by_key_meta: Dict[str, Dict[str, str]] = {}
+    for it in io_items + dom_items:
+        mk = normalize_media_key(it.get("url", "") or "")
+        if not mk:
+            continue
+        prev = by_key_meta.get(mk)
+        if (prev is None) or (_meta_score(it) > _meta_score(prev)):
+            by_key_meta[mk] = {
+                "uploader_name": it.get("uploader_name", "") or "",
+                "upload_time": it.get("upload_time", "") or "",
+                "tweet_id": it.get("tweet_id", "") or "",
+            }
+
+    for e in entries:
+        mk = normalize_media_key(e.get("url", "") or "")
+        if not mk:
+            continue
+        m = by_key_meta.get(mk)
+        if not m:
+            continue
+        changed = False
+        if not (e.get("uploader_name") or "") and (m.get("uploader_name") or ""):
+            e["uploader_name"] = m["uploader_name"]
+            changed = True
+        if not (e.get("upload_time") or "") and (m.get("upload_time") or ""):
+            e["upload_time"] = m["upload_time"]
+            changed = True
+        if not (e.get("tweet_id") or "") and (m.get("tweet_id") or ""):
+            e["tweet_id"] = m["tweet_id"]
+            changed = True
+        if changed:
+            updated += 1
+    return updated
 
 def merge_into_meta_map(meta_map: Dict[str, Dict[str, str]], items: List[Dict[str, str]]) -> int:
      
@@ -1298,6 +2999,50 @@ def _jiggle_once(delta_px: int, wait_s: float = 0.08):
     except Exception:
         pass
 
+def _descent_rescue_probe(
+    cdp_seen_keys: set[str],
+    cdp_url_by_key: Dict[str, str],
+    cdp_meta_by_key: Dict[str, Dict[str, str]] | None = None,
+) -> Tuple[bool, int, int, int]:
+    y0 = _get_scroll_y()
+    h0 = _get_scroll_h()
+    k0 = len(cdp_seen_keys)
+    vh = _get_vh()
+    try:
+        driver.execute_script("window.scrollBy(0, arguments[0]);", -int(max(600, vh * 0.9)))
+        time.sleep(max(0.18, DOWN_DELAY_S * 5))
+        _ = update_cdp_seen_from_logs_with_keys(cdp_seen_keys, cdp_url_by_key, cdp_meta_by_key=cdp_meta_by_key)
+        _ = backfill_tweet_id_from_graphql_bodies(cdp_meta_by_key or {}, max_bodies=250, quiet=True)
+        driver.execute_script("window.scrollBy(0, arguments[0]);", int(max(1400, vh * 1.8)))
+        time.sleep(max(0.35, DOWN_DELAY_S * 8))
+        _ = update_cdp_seen_from_logs_with_keys(cdp_seen_keys, cdp_url_by_key, cdp_meta_by_key=cdp_meta_by_key)
+        _ = backfill_tweet_id_from_graphql_bodies(cdp_meta_by_key or {}, max_bodies=250, quiet=True)
+        driver.execute_script("window.scrollBy(0, arguments[0]);", int(max(1400, vh * 1.8)))
+        time.sleep(max(0.35, DOWN_DELAY_S * 8))
+        _ = update_cdp_seen_from_logs_with_keys(cdp_seen_keys, cdp_url_by_key, cdp_meta_by_key=cdp_meta_by_key)
+        _ = backfill_tweet_id_from_graphql_bodies(cdp_meta_by_key or {}, max_bodies=250, quiet=True)
+    except Exception:
+        pass
+    y1 = _get_scroll_y()
+    h1 = _get_scroll_h()
+    k1 = len(cdp_seen_keys)
+    progressed = (h1 > h0 + 8) or (y1 > y0 + 8) or (k1 > k0)
+    return progressed, y1, h1, k1 - k0
+
+def _dynamic_upward_scan_limit(start_y: int, step: int, rounds: int = 0, margin_steps: int = 80) -> int:
+    """
+    Safety cap for bottom-to-top repair scans.
+    It is based on the known descent bottom instead of a small fixed round count,
+    so scans can actually reach top on long virtual timelines.
+    """
+    step_eff = max(1, int(step or 1))
+    known_y = max(int(start_y or 0), int(LAST_FULL_DESCENT_BOTTOM_Y or 0))
+    if LAST_FULL_DESCENT_SCROLL_H > 0:
+        known_y = max(known_y, int(LAST_FULL_DESCENT_SCROLL_H - _get_vh()))
+    expected = int(known_y / step_eff) + int(margin_steps)
+    round_floor = max(0, int(rounds or 0) * 3)
+    return max(120, round_floor, expected)
+
 def bootstrap_observers():
     # IO/MutationObserver를 페이지에 주입(하강/SAFE 모두에서 사용). 
     try:
@@ -1316,7 +3061,9 @@ def pre_descent_jiggle(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str]) 
 
 def full_descent(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str],
                  desc_meta_by_key: Dict[str, Dict[str, str]],
-                 stop_when_seen_keys: set[str] | None = None) -> int:
+                 stop_when_seen_keys: set[str] | None = None,
+                 cdp_meta_by_key: Dict[str, Dict[str, str]] | None = None) -> int:
+    global LAST_FULL_DESCENT_BOTTOM_Y, LAST_FULL_DESCENT_SCROLL_H
      
     # 끝까지 하강. Burst마다 진행 로그 출력, DESCENT_CDP_LOG_INTERVAL마다 CDP/IO drain.
     # 반환: 하강 구간에서 관측한 cdpKeys 피크값(peak)
@@ -1339,115 +3086,209 @@ def full_descent(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str],
     stop_reason = "unknown"
     cdp_peak = len(cdp_seen_keys)
     seen_hit_streak = 0
+    meta_ready_base = _count_ready_meta_for_keys(cdp_seen_keys, desc_meta_by_key, cdp_meta_by_key)
+    rescue_attempts = 0
+    max_rescue_attempts = 36 if FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL > 0 else 4
+    gql_updated_total = 0
+    gql_updated_recent = 0
 
-    while True:
-        burst_idx += 1
+    # verbose per-burst line logs are noisy for long runs; keep one-line tqdm status by default.
+    verbose_descent_debug = False
+    with tqdm(total=0, desc="Descent", unit="burst", ncols=140, dynamic_ncols=False, leave=True, ascii=True) as pbar:
+        while True:
+            burst_idx += 1
 
-        for _ in range(DOWN_SCROLL_BURST):
-            driver.execute_script("window.scrollBy(0, arguments[0]);", down_step_px_eff)
-            time.sleep(DOWN_DELAY_S)
+            for _ in range(DOWN_SCROLL_BURST):
+                driver.execute_script("window.scrollBy(0, arguments[0]);", down_step_px_eff)
+                time.sleep(DOWN_DELAY_S)
 
-        grew = False
-        grew_px = 0
-        for _ in range(DOWN_BUFFER_CHECKS):
-            time.sleep(DOWN_BUFFER_SLEEP_S)
-            cur_h = _get_scroll_h()
-            if cur_h > prev_h:
-                grew = True
-                grew_px = cur_h - prev_h
-                prev_h = cur_h
-                break
+            grew = False
+            grew_px = 0
+            for _ in range(DOWN_BUFFER_CHECKS):
+                time.sleep(DOWN_BUFFER_SLEEP_S)
+                cur_h = _get_scroll_h()
+                if cur_h > prev_h:
+                    grew = True
+                    grew_px = cur_h - prev_h
+                    prev_h = cur_h
+                    break
 
-        cur_y = _get_scroll_y()
-        delta_y = cur_y - last_y
-        if abs(delta_y) <= YOFFSET_EPS:
-            y_stall_seq += 1
-        else:
-            y_stall_seq = 0
-            last_y = cur_y
+            cur_y = _get_scroll_y()
+            delta_y = cur_y - last_y
+            if abs(delta_y) <= YOFFSET_EPS:
+                y_stall_seq += 1
+            else:
+                y_stall_seq = 0
+                last_y = cur_y
 
-        # 한번 더 찔러보기
-        if not grew:
-            driver.execute_script("window.scrollBy(0, arguments[0]);", down_step_px_eff)
-            time.sleep(DOWN_DELAY_S)
-            cur_h2 = _get_scroll_h()
-            if cur_h2 > prev_h:
-                grew = True
-                grew_px = cur_h2 - prev_h
-                prev_h = cur_h2
+            # 한번 더 찔러보기
+            if not grew:
+                driver.execute_script("window.scrollBy(0, arguments[0]);", down_step_px_eff)
+                time.sleep(DOWN_DELAY_S)
+                cur_h2 = _get_scroll_h()
+                if cur_h2 > prev_h:
+                    grew = True
+                    grew_px = cur_h2 - prev_h
+                    prev_h = cur_h2
 
-        stall_cycles = 0 if grew else (stall_cycles + 1)
+            stall_cycles = 0 if grew else (stall_cycles + 1)
 
-        # 주기적 CDP/IO drain
-        ioNew = 0
-        new_added = 0
-        if (burst_idx % DESCENT_CDP_LOG_INTERVAL) == 0:
-            new_added, new_keys = update_cdp_seen_from_logs_with_keys(cdp_seen_keys, cdp_url_by_key)
-            cdp_peak = max(cdp_peak, len(cdp_seen_keys))
-            io_items = flush_io_buffer()
-            ioNew = merge_into_meta_map(desc_meta_by_key, io_items)
-            print(
-                f"debug: downBurst={burst_idx}, perBurstScrolls={DOWN_SCROLL_BURST}, "
-                f"yOffset={cur_y}, deltaY={delta_y}, scrollHeight={prev_h}, grewPx={grew_px}, grew={int(grew)}, "
-                f"heightStallSeq={stall_cycles}/{DOWN_STALL_TOLERANCE}, yStallSeq={y_stall_seq}/{YOFFSET_STALL_BURSTS}, "
-                f"cdpKeys={len(cdp_seen_keys)}, cdpNew={new_added}, ioKeys={len(desc_meta_by_key)}, ioNew={ioNew}"
-            )
-            if stop_when_seen_keys:
-                hit_keys = [k for k in new_keys if k in stop_when_seen_keys]
-                fresh_keys = [k for k in new_keys if k not in stop_when_seen_keys]
-                if hit_keys and fresh_keys:
-                    if seen_hit_streak > 0:
-                        print(
-                            f"message: periodic stop-streak reset "
-                            f"(hit+new in same burst, prevStreak={seen_hit_streak}, "
-                            f"hitSample={hit_keys[0]}, newSample={fresh_keys[0]})"
-                        )
-                    seen_hit_streak = 0
-                elif hit_keys:
-                    seen_hit_streak += 1
+            # 주기적 CDP/IO drain
+            ioNew = 0
+            new_added = 0
+            if (burst_idx % DESCENT_CDP_LOG_INTERVAL) == 0:
+                new_added, new_keys = update_cdp_seen_from_logs_with_keys(
+                    cdp_seen_keys, cdp_url_by_key, cdp_meta_by_key=cdp_meta_by_key
+                )
+                cdp_peak = max(cdp_peak, len(cdp_seen_keys))
+                io_items = flush_io_buffer()
+                ioNew = merge_into_meta_map(desc_meta_by_key, io_items)
+                if cdp_meta_by_key is not None and (burst_idx % 5) == 0:
+                    gql_updated_recent = backfill_tweet_id_from_graphql_bodies(cdp_meta_by_key, max_bodies=400, quiet=True)
+                    gql_updated_total += gql_updated_recent
+                if verbose_descent_debug:
                     print(
-                        f"message: periodic stop-streak {seen_hit_streak}/{PERIODIC_STOP_HIT_STREAK} "
-                        f"(hitOnly, hitSample={hit_keys[0]})"
+                        f"debug: downBurst={burst_idx}, perBurstScrolls={DOWN_SCROLL_BURST}, "
+                        f"yOffset={cur_y}, deltaY={delta_y}, scrollHeight={prev_h}, grewPx={grew_px}, grew={int(grew)}, "
+                        f"heightStallSeq={stall_cycles}/{DOWN_STALL_TOLERANCE}, yStallSeq={y_stall_seq}/{YOFFSET_STALL_BURSTS}, "
+                        f"cdpKeys={len(cdp_seen_keys)}, cdpNew={new_added}, ioKeys={len(desc_meta_by_key)}, ioNew={ioNew}"
                     )
-                    if seen_hit_streak >= PERIODIC_STOP_HIT_STREAK:
-                        stop_reason = f"seen-existing-key-streak x{seen_hit_streak} (sample={hit_keys[0]})"
-                        print(f"message: stop trigger reached by periodic hit-streak. media_key={hit_keys[0]}")
-                        break
-                else:
-                    if seen_hit_streak > 0:
+                if stop_when_seen_keys:
+                    hit_keys = [k for k in new_keys if k in stop_when_seen_keys]
+                    fresh_keys = [k for k in new_keys if k not in stop_when_seen_keys]
+                    if hit_keys and fresh_keys:
+                        if seen_hit_streak > 0:
+                            print(
+                                f"message: periodic stop-streak reset "
+                                f"(hit+new in same burst, prevStreak={seen_hit_streak}, "
+                                f"hitSample={hit_keys[0]}, newSample={fresh_keys[0]})"
+                            )
+                        seen_hit_streak = 0
+                    elif hit_keys:
+                        seen_hit_streak += 1
                         print(
-                            f"message: periodic stop-streak reset "
-                            f"(no hit in this burst, prevStreak={seen_hit_streak})"
+                            f"message: periodic stop-streak {seen_hit_streak}/{PERIODIC_STOP_HIT_STREAK} "
+                            f"(hitOnly, hitSample={hit_keys[0]})"
                         )
-                    seen_hit_streak = 0
-        else:
-            print(
-                f"debug: downBurst={burst_idx}, perBurstScrolls={DOWN_SCROLL_BURST}, "
-                f"yOffset={cur_y}, deltaY={delta_y}, scrollHeight={prev_h}, grewPx={grew_px}, grew={int(grew)}, "
-                f"heightStallSeq={stall_cycles}/{DOWN_STALL_TOLERANCE}, yStallSeq={y_stall_seq}/{YOFFSET_STALL_BURSTS}"
-            )
+                        if seen_hit_streak >= PERIODIC_STOP_HIT_STREAK:
+                            stop_reason = f"seen-existing-key-streak x{seen_hit_streak} (sample={hit_keys[0]})"
+                            print(f"message: stop trigger reached by periodic hit-streak. media_key={hit_keys[0]}")
+                            break
+                    else:
+                        if seen_hit_streak > 0:
+                            print(
+                                f"message: periodic stop-streak reset "
+                                f"(no hit in this burst, prevStreak={seen_hit_streak})"
+                            )
+                        seen_hit_streak = 0
+            elif verbose_descent_debug:
+                print(
+                    f"debug: downBurst={burst_idx}, perBurstScrolls={DOWN_SCROLL_BURST}, "
+                    f"yOffset={cur_y}, deltaY={delta_y}, scrollHeight={prev_h}, grewPx={grew_px}, grew={int(grew)}, "
+                    f"heightStallSeq={stall_cycles}/{DOWN_STALL_TOLERANCE}, yStallSeq={y_stall_seq}/{YOFFSET_STALL_BURSTS}"
+                )
 
-        if stall_cycles >= DOWN_STALL_TOLERANCE:
-            stop_reason = f"height-stall x{stall_cycles}"
-            break
-        if y_stall_seq >= YOFFSET_STALL_BURSTS:
-            stop_reason = f"yoffset-stall x{y_stall_seq}"
-            break
+            pbar.update(1)
+            meta_ready_now = _count_ready_meta_for_keys(cdp_seen_keys, desc_meta_by_key, cdp_meta_by_key)
+            meta_recovered = max(0, meta_ready_now - meta_ready_base)
+            meta_missing = max(0, len(cdp_seen_keys) - meta_ready_now)
+            pbar.set_postfix({
+                "y": cur_y,
+                "h": prev_h,
+                "cdp": len(cdp_seen_keys),
+                "io": len(desc_meta_by_key),
+                "metaMiss": meta_missing,
+                "metaRec": meta_recovered,
+                "gql": gql_updated_total,
+                "stall": f"{stall_cycles}/{DOWN_STALL_TOLERANCE}",
+                "hit": seen_hit_streak if stop_when_seen_keys else "-"
+            }, refresh=False)
+
+            if stall_cycles >= DOWN_STALL_TOLERANCE:
+                if rescue_attempts < max_rescue_attempts and (
+                    FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL <= 0
+                    or len(cdp_seen_keys) < FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL
+                ):
+                    rescue_attempts += 1
+                    progressed, ry, rh, rk = _descent_rescue_probe(
+                        cdp_seen_keys,
+                        cdp_url_by_key,
+                        cdp_meta_by_key=cdp_meta_by_key,
+                    )
+                    print(
+                        f"message: descent rescue {rescue_attempts}/{max_rescue_attempts} "
+                        f"progress={int(progressed)}, y={ry}, h={rh}, cdpNew={rk}, "
+                        f"cdp={len(cdp_seen_keys)}/{FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL or '-'}"
+                    )
+                    if progressed:
+                        prev_h = max(prev_h, rh)
+                        last_y = ry
+                        stall_cycles = 0
+                        y_stall_seq = 0
+                        cdp_peak = max(cdp_peak, len(cdp_seen_keys))
+                        continue
+                stop_reason = f"height-stall x{stall_cycles}"
+                break
+            if y_stall_seq >= YOFFSET_STALL_BURSTS:
+                if rescue_attempts < max_rescue_attempts and (
+                    FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL <= 0
+                    or len(cdp_seen_keys) < FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL
+                ):
+                    rescue_attempts += 1
+                    progressed, ry, rh, rk = _descent_rescue_probe(
+                        cdp_seen_keys,
+                        cdp_url_by_key,
+                        cdp_meta_by_key=cdp_meta_by_key,
+                    )
+                    print(
+                        f"message: descent rescue {rescue_attempts}/{max_rescue_attempts} "
+                        f"progress={int(progressed)}, y={ry}, h={rh}, cdpNew={rk}, "
+                        f"cdp={len(cdp_seen_keys)}/{FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL or '-'}"
+                    )
+                    if progressed:
+                        prev_h = max(prev_h, rh)
+                        last_y = ry
+                        stall_cycles = 0
+                        y_stall_seq = 0
+                        cdp_peak = max(cdp_peak, len(cdp_seen_keys))
+                        continue
+                stop_reason = f"yoffset-stall x{y_stall_seq}"
+                break
 
     # 최종 drain(마지막 남은 이벤트/버퍼 수거)
     _ = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
     io_items = flush_io_buffer()
     _ = merge_into_meta_map(desc_meta_by_key, io_items)
 
+    LAST_FULL_DESCENT_BOTTOM_Y = max(LAST_FULL_DESCENT_BOTTOM_Y, _get_scroll_y())
+    LAST_FULL_DESCENT_SCROLL_H = max(LAST_FULL_DESCENT_SCROLL_H, _get_scroll_h())
     print(f"message: full-descent finished. stopReason={stop_reason}, yOffset={_get_scroll_y()}, scrollHeight={_get_scroll_h()}, cdpKeys={len(cdp_seen_keys)}, ioKeys={len(desc_meta_by_key)}")
     return cdp_peak
 
 # -----------------------------------------------------------------------------
 # SAFE: 업스크롤 수집(타겟 매칭 및 메타 확보)
 # -----------------------------------------------------------------------------
-def _poll_once_and_confirm(target_keys: set[str], confirmed_keys: set[str], confirmed: Dict[str, Dict[str, str]]) -> Tuple[int,int,int,int]:
+def _poll_once_and_confirm(
+    target_keys: set[str],
+    confirmed_keys: set[str],
+    confirmed: Dict[str, Dict[str, str]],
+    cdp_seen_keys_ref: set[str] | None = None,
+    cdp_url_by_key_ref: Dict[str, str] | None = None,
+    cdp_meta_by_key_ref: Dict[str, Dict[str, str]] | None = None,
+) -> Tuple[int,int,int,int]:
     # IO 버퍼+DOM 스냅샷을 병합하여 Target에 해당하는 키를 확정. 
     jsCalls = 0
+
+    # CDP 로그를 우선 drain해서 비디오 URL도 동일한 confirm 경로로 태운다.
+    local_seen = cdp_seen_keys_ref if cdp_seen_keys_ref is not None else set()
+    local_url_by_key = cdp_url_by_key_ref if cdp_url_by_key_ref is not None else {}
+    local_meta_by_key = cdp_meta_by_key_ref if cdp_meta_by_key_ref is not None else {}
+
+    cdp_new, _ = update_cdp_seen_from_logs_with_keys(
+        local_seen,
+        local_url_by_key,
+        cdp_meta_by_key=local_meta_by_key,
+    )
 
     io_items = flush_io_buffer()
     jsCalls += 1
@@ -1473,28 +3314,99 @@ def _poll_once_and_confirm(target_keys: set[str], confirmed_keys: set[str], conf
             u = it["url"]
             if u not in merged:
                 merged[u] = it
+    # CDP에서 확보한 타겟 URL/메타도 merge에 포함(특히 video.twimg.com 계열).
+    for mk in target_keys:
+        cu = local_url_by_key.get(mk, "")
+        if not cu:
+            continue
+        if cu not in merged:
+            cmeta = local_meta_by_key.get(mk, {}) or {}
+            merged[cu] = {
+                "url": cu,
+                "uploader_name": cmeta.get("uploader_name", ""),
+                "upload_time": cmeta.get("upload_time", ""),
+                "tweet_id": cmeta.get("tweet_id", ""),
+            }
+    visible_tids = collect_visible_tweet_ids()
+    single_visible_tid = visible_tids[0] if len(visible_tids) == 1 else ""
 
     new_cnt = 0
     dup_cnt = 0
+    target_key_by_id: Dict[str, str] = {}
+    for tk in target_keys:
+        m = re.match(r"^(ext_tw_video|amplify_video)_(\d+)$", tk)
+        if m:
+            target_key_by_id[m.group(2)] = tk
+
     for u, it in merged.items():
         mk = normalize_media_key(u)
         if not mk:
             continue
-        if mk in target_keys:
-            if mk not in confirmed_keys:
-                confirmed_keys.add(mk)
-                confirmed[mk] = {
+        matched_key = mk
+        if matched_key not in target_keys:
+            m = re.match(r"^(ext_tw_video|amplify_video)_(\d+)$", matched_key)
+            if m:
+                matched_key = target_key_by_id.get(m.group(2), matched_key)
+        if matched_key in target_keys:
+            if matched_key not in confirmed_keys:
+                confirmed_keys.add(matched_key)
+                confirmed[matched_key] = {
                     "url": u,
                     "uploader_name": it.get("uploader_name", ""),
                     "upload_time": it.get("upload_time", ""),
-                    "tweet_id": it.get("tweet_id", ""),
+                    "tweet_id": (it.get("tweet_id", "") or single_visible_tid),
                 }
                 new_cnt += 1
             else:
+                # 이미 확정된 키라도, 이번에 더 좋은 메타가 보이면 갱신한다.
+                prev = confirmed.get(matched_key, {})
+                prev_meta = {
+                    "uploader_name": prev.get("uploader_name", "") or "",
+                    "upload_time": prev.get("upload_time", "") or "",
+                    "tweet_id": prev.get("tweet_id", "") or "",
+                }
+                cur_meta = {
+                    "uploader_name": it.get("uploader_name", "") or "",
+                    "upload_time": it.get("upload_time", "") or "",
+                    "tweet_id": (it.get("tweet_id", "") or single_visible_tid or ""),
+                }
+                best = pick_better_meta(prev_meta, cur_meta)
+                changed = False
+                if (best.get("uploader_name", "") or "") != (prev.get("uploader_name", "") or ""):
+                    prev["uploader_name"] = best.get("uploader_name", "") or ""
+                    changed = True
+                if (best.get("upload_time", "") or "") != (prev.get("upload_time", "") or ""):
+                    prev["upload_time"] = best.get("upload_time", "") or ""
+                    changed = True
+                if (best.get("tweet_id", "") or "") != (prev.get("tweet_id", "") or ""):
+                    prev["tweet_id"] = best.get("tweet_id", "") or ""
+                    changed = True
+                # URL도 더 나은 품질(특히 video)로 업데이트
+                if _video_quality_score(u) > _video_quality_score(prev.get("url", "") or ""):
+                    prev["url"] = u
+                    changed = True
+                if changed:
+                    confirmed[matched_key] = prev
+                if single_visible_tid and not (confirmed.get(matched_key, {}).get("tweet_id") or ""):
+                    confirmed[matched_key]["tweet_id"] = single_visible_tid
                 dup_cnt += 1
+    verbose_safe_poll = False
+    if verbose_safe_poll and new_cnt == 0 and cdp_new > 0 and target_keys:
+        sample_targets = ", ".join(list(target_keys)[:3])
+        print(
+            f"debug: [SAFE-POLL] cdpNew={cdp_new}, merged={len(merged)}, "
+            f"sampleTargets={sample_targets}"
+        )
     return new_cnt, dup_cnt, len(merged), jsCalls
 
-def _poll_until_settled(target_keys: set[str], confirmed_keys: set[str], confirmed: Dict[str, Dict[str, str]]) -> Tuple[int,int,int,int]:
+def _poll_until_settled(
+    target_keys: set[str],
+    confirmed_keys: set[str],
+    confirmed: Dict[str, Dict[str, str]],
+    cdp_seen_keys_ref: set[str] | None = None,
+    cdp_url_by_key_ref: Dict[str, str] | None = None,
+    cdp_meta_by_key_ref: Dict[str, Dict[str, str]] | None = None,
+) -> Tuple[int,int,int,int]:
     # 단계 내에서 수집이 안정될 때까지 짧게 폴링. 
     STEP_MIN_SETTLE_S = 0.30
     idle_seq = 0
@@ -1505,7 +3417,14 @@ def _poll_until_settled(target_keys: set[str], confirmed_keys: set[str], confirm
     js_calls = 0
 
     while True:
-        a, d, b, c = _poll_once_and_confirm(target_keys, confirmed_keys, confirmed)
+        a, d, b, c = _poll_once_and_confirm(
+            target_keys,
+            confirmed_keys,
+            confirmed,
+            cdp_seen_keys_ref=cdp_seen_keys_ref,
+            cdp_url_by_key_ref=cdp_url_by_key_ref,
+            cdp_meta_by_key_ref=cdp_meta_by_key_ref,
+        )
         new_total += a
         dup_total += d
         last_batch_size = b
@@ -1530,13 +3449,142 @@ def pre_upward_jiggle(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str]) -
     added = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
     print(f"message: pre-upward jiggle done (vh={vh}, delta={delta}, cdpNew={added})")
 
-def safe_upward_collect(target_keys: set[str], target_url_by_key: Dict[str, str]) -> Tuple[Dict[str, Dict[str, str]], set[str], List[str]]:
+def force_scroll_near_bottom(max_iters: int = 60) -> Tuple[int, int]:
+    """
+    Force page near bottom using repeated downward scrolls.
+    Returns (start_y, end_y).
+    """
+    start_y = _get_scroll_y()
+    vh = _get_vh()
+    step = max(400, int(0.9 * vh))
+    stall = 0
+    last_y = start_y
+    for _ in range(max_iters):
+        driver.execute_script("window.scrollBy(0, arguments[0]);", step)
+        time.sleep(max(0.03, DOWN_DELAY_S))
+        y = _get_scroll_y()
+        if y <= last_y + 1:
+            stall += 1
+        else:
+            stall = 0
+            last_y = y
+        # reached bottom-ish
+        h = _get_scroll_h()
+        if y + vh >= h - 8:
+            break
+        if stall >= 5:
+            break
+    return start_y, _get_scroll_y()
+
+def force_scroll_true_bottom(max_steps: int = 6000) -> Tuple[int, int]:
+    """
+    Force scroll to real bottom for virtualized timelines.
+    Uses height-growth + y-stall checks (similar spirit to full_descent).
+    Returns (start_y, end_y).
+    """
+    start_y = _get_scroll_y()
+    vh = _get_vh()
+    step = max(240, min(DOWN_STEP_PX, int(0.70 * vh)))
+    prev_h = _get_scroll_h()
+    last_y = start_y
+    stall_h = 0
+    stall_y = 0
+    from_top = start_y <= 2
+    known_bottom_floor = int(LAST_FULL_DESCENT_BOTTOM_Y * 0.92) if LAST_FULL_DESCENT_BOTTOM_Y > 0 else 0
+    min_seek_px_from_top = max(50000, int(vh * 20), known_bottom_floor)
+    min_steps_from_top = 60 if not known_bottom_floor else max(60, int(known_bottom_floor / max(1, step) * 0.60))
+    i = 0
+    for _ in range(max_steps):
+        i += 1
+        driver.execute_script("window.scrollBy(0, arguments[0]);", step)
+        time.sleep(max(0.03, DOWN_DELAY_S))
+        y = _get_scroll_y()
+        h = _get_scroll_h()
+
+        if h > prev_h:
+            prev_h = h
+            stall_h = 0
+        else:
+            stall_h += 1
+
+        if y <= last_y + 1:
+            stall_y += 1
+        else:
+            stall_y = 0
+            last_y = y
+
+        ready_to_stop_from_top = (not from_top) or (y >= min_seek_px_from_top and i >= min_steps_from_top)
+        if ready_to_stop_from_top and y + vh >= prev_h - 8 and stall_h >= 2:
+            break
+        if ready_to_stop_from_top and (stall_h >= DOWN_STALL_TOLERANCE or stall_y >= YOFFSET_STALL_BURSTS):
+            break
+        if from_top and not ready_to_stop_from_top and (stall_h >= DOWN_STALL_TOLERANCE or stall_y >= YOFFSET_STALL_BURSTS):
+            try:
+                driver.execute_script("window.scrollBy(0, arguments[0]);", -int(max(120, vh * 0.25)))
+                time.sleep(max(0.08, DOWN_DELAY_S * 2))
+                driver.execute_script("window.scrollBy(0, arguments[0]);", int(max(step, vh * 0.9)))
+                time.sleep(max(0.12, DOWN_DELAY_S * 3))
+            except Exception:
+                pass
+            stall_h = 0
+            stall_y = 0
+            last_y = _get_scroll_y()
+            prev_h = max(prev_h, _get_scroll_h())
+    return start_y, _get_scroll_y()
+
+def ensure_top_start(label: str = "") -> Tuple[int, int]:
+    y0 = _get_scroll_y()
+    if y0 > 2:
+        try:
+            driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(max(0.03, UP_DELAY_S))
+        except Exception:
+            pass
+    y1 = _get_scroll_y()
+    if label:
+        print(f"message: {label} ensure-top startY {y0} -> {y1}")
+    return y0, y1
+
+def ensure_bottom_start(label: str = "") -> Tuple[int, int]:
+    y0 = _get_scroll_y()
+    if y0 <= 2:
+        s0, s1 = force_scroll_true_bottom()
+        if label:
+            print(f"message: {label} ensure-bottom via true-bottom {s0} -> {s1}")
+        return y0, s1
+    y1 = _get_scroll_y()
+    if label:
+        print(f"message: {label} ensure-bottom reuse current y={y1}")
+    return y0, y1
+
+def ensure_repair_bottom_start(label: str = "") -> Tuple[int, int]:
+    y0 = _get_scroll_y()
+    if y0 <= 50 and LAST_FULL_DESCENT_BOTTOM_Y > 0:
+        try:
+            driver.execute_script("window.scrollTo(0, arguments[0]);", int(LAST_FULL_DESCENT_BOTTOM_Y))
+            time.sleep(max(0.20, DOWN_DELAY_S * 6))
+        except Exception:
+            pass
+        y_mid = _get_scroll_y()
+        if y_mid >= int(LAST_FULL_DESCENT_BOTTOM_Y * 0.85):
+            if label:
+                print(f"message: {label} ensure-bottom via remembered-bottom {y0} -> {y_mid}")
+            return y0, y_mid
+    return ensure_bottom_start(label)
+
+def safe_upward_collect(
+    target_keys: set[str],
+    target_url_by_key: Dict[str, str],
+    cdp_seen_keys_ref: set[str] | None = None,
+    cdp_url_by_key_ref: Dict[str, str] | None = None,
+    cdp_meta_by_key_ref: Dict[str, Dict[str, str]] | None = None,
+) -> Tuple[Dict[str, Dict[str, str]], set[str], List[str]]:
     # SAFE 업스크롤 수집. 반환: (확정맵, 확정키집합, Missing 키 List) 
     confirmed: Dict[str, Dict[str, str]] = {}
     confirmed_keys: set[str] = set()
 
     # === MOD: 상승 시작 직전에 jiggle 1회로 바닥 부근 로딩 유도
-    pre_upward_jiggle(cdp_seen_keys, cdp_url_by_key)
+    pre_upward_jiggle(cdp_seen_keys_ref or set(), cdp_url_by_key_ref or {})
 
     try:
         vh = driver.execute_script("return window.innerHeight") or 900
@@ -1551,37 +3599,100 @@ def safe_upward_collect(target_keys: set[str], target_url_by_key: Dict[str, str]
     move_px = min(move_px0, max_move_by_ratio)
 
     TargetTotalSeen = len(target_keys)
+    meta_ready_base = _count_ready_meta_for_keys(target_keys, confirmed, cdp_meta_by_key_ref)
 
     step = 0
     top_stall_seq = 0
     crawl_t0 = time.time()
+    with tqdm(total=0, desc="SAFE-Up", unit="step", dynamic_ncols=True, leave=True) as pbar:
+        while True:
+            step += 1
+            curr_y = _get_scroll_y()
 
-    while True:
-        step += 1
-        curr_y = _get_scroll_y()
+            if curr_y <= 2:
+                a, d, b, js_calls = _poll_once_and_confirm(
+                    target_keys,
+                    confirmed_keys,
+                    confirmed,
+                    cdp_seen_keys_ref=cdp_seen_keys_ref,
+                    cdp_url_by_key_ref=cdp_url_by_key_ref,
+                    cdp_meta_by_key_ref=cdp_meta_by_key_ref,
+                )
+                pbar.update(1)
+                meta_ready_now = _count_ready_meta_for_keys(target_keys, confirmed, cdp_meta_by_key_ref)
+                meta_recovered = max(0, meta_ready_now - meta_ready_base)
+                meta_missing = max(0, TargetTotalSeen - meta_ready_now)
+                pbar.set_postfix({
+                    "new": a,
+                    "dup": d,
+                    "batch": b,
+                    "js": js_calls,
+                    "y": _get_scroll_y(),
+                    "seen": f"{len(confirmed_keys)}/{TargetTotalSeen}",
+                    "metaMiss": meta_missing,
+                    "metaRec": meta_recovered,
+                    "final": 1
+                }, refresh=False)
+                break
 
-        if curr_y <= 2:
-            a, d, b, js_calls = _poll_once_and_confirm(target_keys, confirmed_keys, confirmed)
-            print(f"debug: [MODE=SAFE] scrollstep={step}(final), newURL={a}, dupURL={d}, batchSize={b}, jsCalls={js_calls}, yOffset={_get_scroll_y()}, TargetTotalSeen={TargetTotalSeen}, CurrentTotalSeen={len(confirmed_keys)}")
-            break
+            new_total, dup_total, last_batch_size, total_js_calls = _poll_until_settled(
+                target_keys,
+                confirmed_keys,
+                confirmed,
+                cdp_seen_keys_ref=cdp_seen_keys_ref,
+                cdp_url_by_key_ref=cdp_url_by_key_ref,
+                cdp_meta_by_key_ref=cdp_meta_by_key_ref,
+            )
+            pbar.update(1)
+            meta_ready_now = _count_ready_meta_for_keys(target_keys, confirmed, cdp_meta_by_key_ref)
+            meta_recovered = max(0, meta_ready_now - meta_ready_base)
+            meta_missing = max(0, TargetTotalSeen - meta_ready_now)
+            pbar.set_postfix({
+                "new": new_total,
+                "dup": dup_total,
+                "batch": last_batch_size,
+                "js": total_js_calls,
+                "y": curr_y,
+                "seen": f"{len(confirmed_keys)}/{TargetTotalSeen}",
+                "metaMiss": meta_missing,
+                "metaRec": meta_recovered,
+            }, refresh=False)
 
-        new_total, dup_total, last_batch_size, total_js_calls = _poll_until_settled(target_keys, confirmed_keys, confirmed)
-        print(f"debug: [MODE=SAFE] scrollstep={step}, newURL={new_total}, dupURL={dup_total}, batchSize={last_batch_size}, jsCalls={total_js_calls}, yOffset={curr_y}, TargetTotalSeen={TargetTotalSeen}, CurrentTotalSeen={len(confirmed_keys)}")
+            prev_y = _get_scroll_y()
+            driver.execute_script("window.scrollBy(0, arguments[0]);", -int(move_px))
+            time.sleep(UP_DELAY_S)
+            cur_y = _get_scroll_y()
 
-        prev_y = _get_scroll_y()
-        driver.execute_script("window.scrollBy(0, arguments[0]);", -int(move_px))
-        time.sleep(UP_DELAY_S)
-        cur_y = _get_scroll_y()
+            if cur_y >= prev_y - 1:
+                top_stall_seq += 1
+            else:
+                top_stall_seq = 0
 
-        if cur_y >= prev_y - 1:
-            top_stall_seq += 1
-        else:
-            top_stall_seq = 0
-
-        if cur_y <= 2 and top_stall_seq >= 3:
-            a, d, b, js_calls = _poll_once_and_confirm(target_keys, confirmed_keys, confirmed)
-            print(f"debug: [MODE=SAFE] scrollstep={step}(final), newURL={a}, dupURL={d}, batchSize={b}, jsCalls={js_calls}, yOffset={_get_scroll_y()}, TargetTotalSeen={TargetTotalSeen}, CurrentTotalSeen={len(confirmed_keys)}")
-            break
+            if cur_y <= 2 and top_stall_seq >= 3:
+                a, d, b, js_calls = _poll_once_and_confirm(
+                    target_keys,
+                    confirmed_keys,
+                    confirmed,
+                    cdp_seen_keys_ref=cdp_seen_keys_ref,
+                    cdp_url_by_key_ref=cdp_url_by_key_ref,
+                    cdp_meta_by_key_ref=cdp_meta_by_key_ref,
+                )
+                pbar.update(1)
+                meta_ready_now = _count_ready_meta_for_keys(target_keys, confirmed, cdp_meta_by_key_ref)
+                meta_recovered = max(0, meta_ready_now - meta_ready_base)
+                meta_missing = max(0, TargetTotalSeen - meta_ready_now)
+                pbar.set_postfix({
+                    "new": a,
+                    "dup": d,
+                    "batch": b,
+                    "js": js_calls,
+                    "y": _get_scroll_y(),
+                    "seen": f"{len(confirmed_keys)}/{TargetTotalSeen}",
+                    "metaMiss": meta_missing,
+                    "metaRec": meta_recovered,
+                    "final": 1
+                }, refresh=False)
+                break
 
     elapsed = time.time() - crawl_t0
     CurrentTotalSeen = len(confirmed_keys)
@@ -1615,21 +3726,31 @@ def download_one(index: int, data: Dict[str, str], out_dir: str) -> Tuple[bool, 
     upload_time = data.get("upload_time", "")
     tweet_id = data.get("tweet_id", "")
 
-    filename = make_deterministic_filename(url, uploader_name, upload_time, tweet_id=tweet_id)
-    file_path = os.path.join(out_dir, filename)
-
-    if SKIP_IF_EXISTS and os.path.exists(file_path):
-        return True, os.path.basename(file_path), url, None, "skip_exists"
-
     session = make_session()
+    filename: str | None = None
     try:
-        resp = session.get(url, timeout=10)
+        resolved_url = resolve_best_video_url(url, session)
+        filename = make_deterministic_filename(resolved_url, uploader_name, upload_time, tweet_id=tweet_id)
+        filename = ensure_video_filename_extension(resolved_url, filename)
+        file_path = os.path.join(out_dir, filename)
+
+        if SKIP_IF_EXISTS and os.path.exists(file_path):
+            return True, os.path.basename(file_path), resolved_url, None, "skip_exists"
+
+        if ".m3u8" in (resolved_url or "").lower():
+            ok_hls, hls_err = _download_hls_to_mp4(resolved_url, file_path)
+            if ok_hls:
+                return True, os.path.basename(file_path), resolved_url, None, "ok_hls"
+            return False, os.path.basename(file_path), resolved_url, hls_err or "hls_download_failed", "error_hls"
+
+        resp = session.get(resolved_url, timeout=10)
         resp.raise_for_status()
         with open(file_path, "wb") as f:
             f.write(resp.content)
-        return True, os.path.basename(file_path), url, None, "ok"
+        return True, os.path.basename(file_path), resolved_url, None, "ok"
     except Exception as e:
-        return False, filename, url, str(e), "error"
+        fallback_name = filename or make_deterministic_filename(url, uploader_name, upload_time, tweet_id=tweet_id)
+        return False, fallback_name, url, str(e), "error"
     finally:
         try:
             session.close()
@@ -1697,26 +3818,444 @@ def load_seen_media_keys_from_local(items_path: str) -> set[str]:
 
 def append_local_items_ndjson(items_path: str, entries: List[Dict[str, str]]) -> Tuple[int, int]:
     os.makedirs(os.path.dirname(items_path), exist_ok=True)
-    seen = load_seen_media_keys_from_local(items_path)
+    existing_rows = read_local_items_ndjson(items_path)
+    by_key: Dict[str, Dict[str, str]] = {}
+    for obj in existing_rows:
+        mk = (obj.get("media_key") or "").strip()
+        if mk:
+            by_key[mk] = dict(obj)
+
     added = 0
-    with open(items_path, "a", encoding="utf-8") as f:
-        for it in entries:
-            url = canon_media_url(it.get("url", ""))
-            mk = normalize_media_key(url) or ""
-            if not mk or mk in seen:
-                continue
-            seen.add(mk)
-            obj = {
-                "tweet_id": it.get("tweet_id", "") or "",
-                "author": it.get("uploader_name", "") or "",
-                "created_at": it.get("upload_time", "") or "",
-                "created_at_norm": normalize_time(it.get("upload_time", "") or ""),
-                "media_key": mk,
-                "url": url,
-            }
-            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    updated = 0
+    for it in entries:
+        url = canon_media_url(it.get("url", ""))
+        mk = normalize_media_key(url) or ""
+        if not mk:
+            continue
+        incoming = {
+            "tweet_id": it.get("tweet_id", "") or "",
+            "author": it.get("uploader_name", "") or "",
+            "created_at": it.get("upload_time", "") or "",
+            "created_at_norm": normalize_time(it.get("upload_time", "") or ""),
+            "tid_source": it.get("tid_source", "") or "",
+            "tid_confidence": it.get("tid_confidence", "") or "",
+            "media_key": mk,
+            "url": url,
+        }
+        if incoming["tweet_id"] and not incoming["tid_source"]:
+            incoming["tid_source"] = "unknown"
+        if incoming["tweet_id"] and not incoming["tid_confidence"]:
+            incoming["tid_confidence"] = _tid_confidence(incoming["tid_source"])
+        prev = by_key.get(mk)
+        if prev is None:
+            by_key[mk] = incoming
             added += 1
-    return added, len(seen)
+            continue
+
+        changed = False
+        # fill only missing fields; keep existing non-empty data
+        for fld in ("tweet_id", "author", "created_at", "created_at_norm", "tid_source", "tid_confidence"):
+            if not (prev.get(fld) or "") and (incoming.get(fld) or ""):
+                prev[fld] = incoming[fld]
+                changed = True
+        if (not (prev.get("url") or "")) and incoming["url"]:
+            prev["url"] = incoming["url"]
+            changed = True
+        by_key[mk] = prev
+        if changed:
+            updated += 1
+
+    with open(items_path, "w", encoding="utf-8") as f:
+        for obj in by_key.values():
+            out = {
+                "tweet_id": obj.get("tweet_id", "") or "",
+                "author": obj.get("author", "") or "",
+                "created_at": obj.get("created_at", "") or "",
+                "created_at_norm": obj.get("created_at_norm", "") or "",
+                "tid_source": obj.get("tid_source", "") or "",
+                "tid_confidence": obj.get("tid_confidence", "") or "",
+                "media_key": obj.get("media_key", "") or "",
+                "url": obj.get("url", "") or "",
+            }
+            f.write(json.dumps(out, ensure_ascii=False) + "\n")
+    print(f"message: local ndjson merge summary: added={added}, updated_missing_meta={updated}")
+    return added, len(by_key)
+
+def is_video_url(url: str) -> bool:
+    u = (url or "").lower()
+    if "video.twimg.com/" not in u:
+        return False
+    if "/aud/" in u:
+        return False
+    if ".m3u8" in u:
+        return True
+    return is_preferred_video_mp4_url(u)
+
+def _is_unknown_author_value(author: str) -> bool:
+    a = (author or "").strip().lower()
+    return (not a) or ("unknown" in a)
+
+def _row_missing_video_meta(row: Dict[str, str]) -> bool:
+    tid = (row.get("tweet_id") or "").strip()
+    # video.twimg.com 계열은 author/created_at가 DOM에서 안정적으로 안 잡히는 경우가 많다.
+    # 우선 tweet_id 보강을 1차 목표로 본다.
+    return not tid.isdigit()
+
+def _rewrite_video_items_ndjson(items_path: str, rows: List[Dict[str, str]]) -> None:
+    # If operating on unified items.ndjson, preserve non-video rows and update only video rows.
+    unified = os.path.abspath(items_path) == os.path.abspath(BOOKMARK_META_LOCAL_ITEMS_PATH)
+    out_rows: List[Dict[str, str]] = []
+    if unified and os.path.exists(items_path):
+        existing = read_local_items_ndjson(items_path)
+        by_key_new: Dict[str, Dict[str, str]] = {}
+        for r in rows:
+            if not is_video_url(r.get("url", "") or ""):
+                continue
+            mk = (r.get("media_key") or "").strip() or (normalize_media_key(r.get("url", "") or "") or "")
+            if mk:
+                by_key_new[mk] = r
+        seen_new = set()
+        for ex in existing:
+            ex_url = ex.get("url", "") or ""
+            ex_mk = (ex.get("media_key") or "").strip() or (normalize_media_key(ex_url) or "")
+            if is_video_url(ex_url) and ex_mk in by_key_new:
+                out_rows.append(by_key_new[ex_mk])
+                seen_new.add(ex_mk)
+            else:
+                out_rows.append(ex)
+        for mk, r in by_key_new.items():
+            if mk not in seen_new:
+                out_rows.append(r)
+    else:
+        out_rows = list(rows)
+
+    with open(items_path, "w", encoding="utf-8") as f:
+        for obj in out_rows:
+            out = {
+                "tweet_id": obj.get("tweet_id", "") or "",
+                "author": obj.get("author", "") or "",
+                "created_at": obj.get("created_at", "") or "",
+                "created_at_norm": obj.get("created_at_norm", "") or "",
+                "tid_source": obj.get("tid_source", "") or "",
+                "tid_confidence": obj.get("tid_confidence", "") or "",
+                "media_key": obj.get("media_key", "") or "",
+                "url": obj.get("url", "") or "",
+            }
+            f.write(json.dumps(out, ensure_ascii=False) + "\n")
+
+def reset_video_tweet_ids(items_path: str) -> int:
+    rows = read_local_items_ndjson(items_path)
+    changed = 0
+    for r in rows:
+        if (r.get("tweet_id", "") or "").strip():
+            r["tweet_id"] = ""
+            r["tid_source"] = ""
+            r["tid_confidence"] = ""
+            changed += 1
+    _rewrite_video_items_ndjson(items_path, rows)
+    return changed
+
+def _video_only_stats(rows: List[Dict[str, str]]) -> Tuple[int, int, int]:
+    vids = [r for r in rows if is_video_url(r.get("url", "") or "")]
+    unresolved = sum(1 for r in vids if _row_missing_video_meta(r))
+    filled_tid = sum(1 for r in vids if (r.get("tweet_id", "") or "").isdigit())
+    return unresolved, filled_tid, len(vids)
+
+def repair_video_items_meta(
+    items_path: str,
+    preloaded_timeline: bool = False,
+    preloaded_cdp_seen_keys: set[str] | None = None,
+    preloaded_cdp_url_by_key: Dict[str, str] | None = None,
+    preloaded_cdp_meta_by_key: Dict[str, Dict[str, str]] | None = None,
+) -> None:
+    global FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL
+    cdp_seen_keys_local: set[str] = set(preloaded_cdp_seen_keys or set())
+    cdp_url_by_key_local: Dict[str, str] = dict(preloaded_cdp_url_by_key or {})
+    cdp_meta_by_key_local: Dict[str, Dict[str, str]] = dict(preloaded_cdp_meta_by_key or {})
+
+    rows = read_local_items_ndjson(items_path)
+    if not rows:
+        print(f"message: VIDEO_META_REPAIR skipped. no rows in {items_path}")
+        return
+
+    by_key: Dict[str, Dict[str, str]] = {}
+    for r in rows:
+        if not is_video_url(r.get("url", "") or ""):
+            continue
+        mk = (r.get("media_key") or "").strip()
+        if not mk:
+            mk = normalize_media_key(r.get("url", "") or "") or ""
+            r["media_key"] = mk
+        if mk:
+            by_key[mk] = r
+
+    target_keys = {mk for mk, r in by_key.items() if _row_missing_video_meta(r)}
+    author_missing_exists = any(
+        (r.get("tweet_id", "") or "").strip().isdigit() and not (r.get("author") or "").strip()
+        for r in by_key.values()
+    )
+    if not target_keys and not author_missing_exists:
+        print("message: VIDEO_META_REPAIR nothing to fix. no missing-meta rows.")
+        return
+
+    target_url_by_key = {mk: (by_key[mk].get("url", "") or "") for mk in target_keys}
+    print(
+        f"message: VIDEO_META_REPAIR targets={len(target_keys)} totalRows={len(by_key)} "
+        f"authorMissing={author_missing_exists} preloaded={preloaded_timeline}"
+    )
+
+    # In pre-download path, timeline has already been loaded by main collection.
+    # Skip expensive warmup/retarget scans and run backfill-focused passes.
+    if not preloaded_timeline:
+        prev_min_cdp_floor = FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL
+        FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL = max(1200, int(len(rows) * 0.55)) if len(rows) >= 1000 else 0
+        if FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL:
+            print(
+                f"message: VIDEO_META_REPAIR descent min-cdp floor="
+                f"{FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL} from localRows={len(rows)}"
+            )
+        warmup_scroll_for_repair_full(
+            cdp_seen_keys_local,
+            cdp_url_by_key_local,
+            cdp_meta_by_key_local,
+            return_to_top=False,
+        )
+        FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL = prev_min_cdp_floor
+    else:
+        print("message: VIDEO_META_REPAIR preloaded mode: skip warmup/full SAFE retarget scans.")
+
+    confirmed_map: Dict[str, Dict[str, str]] = {}
+    confirmed_keys: set[str] = set()
+    if target_keys and (not preloaded_timeline):
+        print(f"message: VIDEO_META_REPAIR at-bottom start yOffset={_get_scroll_y()}")
+        _ = update_cdp_seen_from_logs_with_keys(
+            cdp_seen_keys_local,
+            cdp_url_by_key_local,
+            cdp_meta_by_key=cdp_meta_by_key_local,
+        )
+        gql_updates = backfill_tweet_id_from_graphql_bodies(cdp_meta_by_key_local)
+        req_updates = backfill_tweet_id_from_cdp_video_requests(cdp_meta_by_key_local)
+        exact_hits = sum(1 for mk in target_keys if mk in cdp_meta_by_key_local)
+        alias_hits = sum(1 for mk in target_keys if _lookup_meta_by_video_key_alias(mk, cdp_meta_by_key_local)[0])
+        print(
+            f"message: VIDEO_META_REPAIR no-safe mode: skip SAFE-Up, run backfill chain. "
+            f"gqlBackfill={gql_updates}, cdpReqBackfill={req_updates}, "
+            f"cdpExactHits={exact_hits}, cdpAliasHits={alias_hits}"
+        )
+    elif target_keys and preloaded_timeline:
+        print("message: VIDEO_META_REPAIR preloaded mode: skip SAFE pass, use lightweight GraphQL/CDP backfill path.")
+        # Reuse already-loaded timeline logs to fill tweet_id without re-running heavy scroll passes.
+        _ = update_cdp_seen_from_logs_with_keys(
+            cdp_seen_keys_local,
+            cdp_url_by_key_local,
+            cdp_meta_by_key=cdp_meta_by_key_local,
+        )
+        gql_updates = backfill_tweet_id_from_graphql_bodies(cdp_meta_by_key_local)
+        req_updates = backfill_tweet_id_from_cdp_video_requests(cdp_meta_by_key_local)
+        cdp_applied = 0
+        for mk in target_keys:
+            prev = by_key.get(mk)
+            if not prev:
+                continue
+            if (prev.get("tweet_id", "") or "").strip():
+                continue
+            cmeta, matched_key = _lookup_meta_by_video_key_alias(mk, cdp_meta_by_key_local)
+            tid = (cmeta.get("tweet_id", "") or "").strip()
+            if tid:
+                prev["tweet_id"] = tid
+                if cmeta.get("uploader_name", "") and not (prev.get("author", "") or "").strip():
+                    prev["author"] = cmeta.get("uploader_name", "")
+                if cmeta.get("upload_time", "") and not (prev.get("created_at", "") or "").strip():
+                    prev["created_at"] = cmeta.get("upload_time", "")
+                    prev["created_at_norm"] = normalize_time(prev.get("created_at", "") or "")
+                src = _source_for_video_key_alias(mk, matched_key) or "graphql"
+                prev["tid_source"] = src
+                prev["tid_confidence"] = _tid_confidence(src)
+                cdp_applied += 1
+        exact_hits = sum(1 for mk in target_keys if mk in cdp_meta_by_key_local)
+        alias_hits = sum(1 for mk in target_keys if _lookup_meta_by_video_key_alias(mk, cdp_meta_by_key_local)[0])
+        print(
+            f"message: VIDEO_META_REPAIR preloaded backfill done. "
+            f"gqlBackfill={gql_updates}, cdpReqBackfill={req_updates}, "
+            f"cdpExactHits={exact_hits}, cdpAliasHits={alias_hits}, cdpApplied={cdp_applied}"
+        )
+    else:
+        print("message: VIDEO_META_REPAIR tweet_id target is empty. skip SAFE tweet_id pass and run author-only pass.")
+
+    updated = 0
+    # Apply whatever metadata we already have from CDP/GraphQL without SAFE-Up dependency.
+    for mk, prev in by_key.items():
+        cmeta, matched_key = _lookup_meta_by_video_key_alias(mk, cdp_meta_by_key_local)
+        new_meta = {
+            "uploader_name": cmeta.get("uploader_name", "") or "",
+            "upload_time": cmeta.get("upload_time", "") or "",
+            "tweet_id": cmeta.get("tweet_id", "") or "",
+        }
+        old_meta = {
+            "uploader_name": prev.get("author", "") or "",
+            "upload_time": prev.get("created_at", "") or "",
+            "tweet_id": prev.get("tweet_id", "") or "",
+        }
+        best = pick_better_meta(old_meta, new_meta)
+        changed = False
+        if (best.get("tweet_id", "") or "") != (prev.get("tweet_id", "") or ""):
+            prev["tweet_id"] = best.get("tweet_id", "") or ""
+            src = _source_for_video_key_alias(mk, matched_key) if prev["tweet_id"] else ""
+            prev["tid_source"] = src
+            prev["tid_confidence"] = _tid_confidence(src) if prev["tweet_id"] else ""
+            changed = True
+        if (best.get("uploader_name", "") or "") != (prev.get("author", "") or ""):
+            prev["author"] = best.get("uploader_name", "") or ""
+            changed = True
+        if (best.get("upload_time", "") or "") != (prev.get("created_at", "") or ""):
+            prev["created_at"] = best.get("upload_time", "") or ""
+            prev["created_at_norm"] = normalize_time(prev.get("created_at", "") or "")
+            changed = True
+        if changed:
+            updated += 1
+
+    rows_after = list(by_key.values())
+    unresolved_meta = sum(1 for r in rows_after if _row_missing_video_meta(r))
+    filled_tid = sum(1 for r in rows_after if (r.get("tweet_id", "") or "").isdigit())
+    _rewrite_video_items_ndjson(items_path, rows_after)
+    print(
+        f"message: VIDEO_META_REPAIR updated={updated}, unresolved={unresolved_meta}, "
+        f"with_tweet_id={filled_tid}/{len(rows_after)}, "
+        f"path={items_path}"
+    )
+    if unresolved_meta > 0:
+        # Sweep by media numeric id across the whole loaded timeline.
+        # This is robust when GraphQL/CDP body parsing yields few/no tweet_id mappings.
+        sweep_updated = backfill_video_tid_by_keyid_sweep(
+            by_key,
+            max_steps=2600 if not preloaded_timeline else 1400,
+            assume_at_bottom=(not preloaded_timeline),
+        )
+        if sweep_updated > 0:
+            rows_after_sweep = list(by_key.values())
+            unresolved_meta = sum(1 for r in rows_after_sweep if _row_missing_video_meta(r))
+            filled_tid = sum(1 for r in rows_after_sweep if (r.get("tweet_id", "") or "").isdigit())
+            _rewrite_video_items_ndjson(items_path, rows_after_sweep)
+            print(
+                f"message: VIDEO_META_REPAIR tid-sweep updated={sweep_updated}, "
+                f"unresolved={unresolved_meta}, with_tweet_id={filled_tid}/{len(rows_after_sweep)}"
+            )
+
+    if unresolved_meta > 0:
+        print("message: VIDEO_META_REPAIR fallback: focus scan start")
+        add_updated = repair_video_items_meta_focus(items_path, rounds=18)
+        rows_after2 = read_local_items_ndjson(items_path)
+        unresolved_meta2, filled_tid2, total2 = _video_only_stats(rows_after2)
+        print(
+            f"message: VIDEO_META_REPAIR focus result updated={add_updated}, "
+            f"unresolved={unresolved_meta2}, with_tweet_id={filled_tid2}/{total2}"
+        )
+        if unresolved_meta2 > 0:
+            print("message: VIDEO_META_REPAIR fallback: strict scan start")
+            strict_updated = repair_video_items_meta_strict(items_path, rounds=24)
+            rows_after3 = read_local_items_ndjson(items_path)
+            unresolved_meta3, filled_tid3, total3 = _video_only_stats(rows_after3)
+            print(
+                f"message: VIDEO_META_REPAIR strict result updated={strict_updated}, "
+                f"unresolved={unresolved_meta3}, with_tweet_id={filled_tid3}/{total3}"
+            )
+
+    # Final pass: keep tweet_id fixed, fill missing author only.
+    rows_final = read_local_items_ndjson(items_path)
+    author_missing_before = sum(
+        1 for r in rows_final if (r.get("tweet_id", "") or "").strip().isdigit() and not (r.get("author") or "").strip()
+    )
+    if author_missing_before > 0:
+        author_updated = backfill_authors_in_video_rows(rows_final, rounds=60)
+        _rewrite_video_items_ndjson(items_path, rows_final)
+        author_missing_after = sum(
+            1 for r in rows_final if (r.get("tweet_id", "") or "").strip().isdigit() and not (r.get("author") or "").strip()
+        )
+        print(
+            f"message: VIDEO_META_REPAIR author-only pass updated={author_updated}, "
+            f"missingAuthor={author_missing_before}->{author_missing_after}"
+        )
+    created_missing_before = sum(
+        1 for r in rows_final if (r.get("tweet_id", "") or "").strip().isdigit() and not (r.get("created_at") or "").strip()
+    )
+    if created_missing_before > 0:
+        created_updated = backfill_created_at_in_video_rows(rows_final, rounds=70)
+        _rewrite_video_items_ndjson(items_path, rows_final)
+        created_missing_after = sum(
+            1 for r in rows_final if (r.get("tweet_id", "") or "").strip().isdigit() and not (r.get("created_at") or "").strip()
+        )
+        print(
+            f"message: VIDEO_META_REPAIR createdAt-only pass updated={created_updated}, "
+            f"missingCreatedAt={created_missing_before}->{created_missing_after}"
+        )
+
+def append_local_video_items_ndjson(items_path: str, entries: List[Dict[str, str]]) -> Tuple[int, int]:
+    os.makedirs(os.path.dirname(items_path), exist_ok=True)
+    existing_rows = read_local_items_ndjson(items_path)
+    by_key: Dict[str, Dict[str, str]] = {}
+    for obj in existing_rows:
+        mk = (obj.get("media_key") or "").strip()
+        if mk:
+            by_key[mk] = dict(obj)
+
+    added = 0
+    updated = 0
+    for it in entries:
+        url = (it.get("url") or "").strip()
+        if not is_video_url(url):
+            continue
+        mk = normalize_media_key(url) or ""
+        if not mk:
+            continue
+        incoming = {
+            "tweet_id": it.get("tweet_id", "") or "",
+            "author": it.get("uploader_name", "") or "",
+            "created_at": it.get("upload_time", "") or "",
+            "created_at_norm": normalize_time(it.get("upload_time", "") or ""),
+            "tid_source": it.get("tid_source", "") or "",
+            "tid_confidence": it.get("tid_confidence", "") or "",
+            "media_key": mk,
+            "url": url,
+        }
+        if incoming["tweet_id"] and not incoming["tid_source"]:
+            incoming["tid_source"] = "unknown"
+        if incoming["tweet_id"] and not incoming["tid_confidence"]:
+            incoming["tid_confidence"] = _tid_confidence(incoming["tid_source"])
+        prev = by_key.get(mk)
+        if prev is None:
+            by_key[mk] = incoming
+            added += 1
+            continue
+
+        changed = False
+        for fld in ("tweet_id", "author", "created_at", "created_at_norm", "tid_source", "tid_confidence"):
+            if not (prev.get(fld) or "") and (incoming.get(fld) or ""):
+                prev[fld] = incoming[fld]
+                changed = True
+        # prefer non-aud / non-0/0 url if previous url was lower quality
+        prev_url = prev.get("url", "") or ""
+        if _video_quality_score(incoming["url"]) > _video_quality_score(prev_url):
+            prev["url"] = incoming["url"]
+            changed = True
+        by_key[mk] = prev
+        if changed:
+            updated += 1
+
+    with open(items_path, "w", encoding="utf-8") as f:
+        for obj in by_key.values():
+            out = {
+                "tweet_id": obj.get("tweet_id", "") or "",
+                "author": obj.get("author", "") or "",
+                "created_at": obj.get("created_at", "") or "",
+                "created_at_norm": obj.get("created_at_norm", "") or "",
+                "tid_source": obj.get("tid_source", "") or "",
+                "tid_confidence": obj.get("tid_confidence", "") or "",
+                "media_key": obj.get("media_key", "") or "",
+                "url": obj.get("url", "") or "",
+            }
+            f.write(json.dumps(out, ensure_ascii=False) + "\n")
+    print(f"message: local video ndjson merge summary: added={added}, updated_missing_meta={updated}")
+    return added, len(by_key)
 
 def write_open_by_tid_py(out_dir: str) -> str:
     os.makedirs(out_dir, exist_ok=True)
@@ -1776,6 +4315,20 @@ def ask_download_now() -> bool:
     print("Collection finished. Choose next action:")
     print("  1) Download now")
     print("  2) Exit without downloading")
+    print("============================================================")
+    print("Press '1' or '2'...")
+    while True:
+        ch = msvcrt.getwch()
+        if ch == "1":
+            return True
+        if ch == "2":
+            return False
+
+def ask_repair_now() -> bool:
+    print("\n============================================================")
+    print("Before download:")
+    print("  1) Run VIDEO_META_REPAIR now (reuse currently loaded timeline)")
+    print("  2) Skip repair and continue")
     print("============================================================")
     print("Press '1' or '2'...")
     while True:
@@ -1851,20 +4404,36 @@ else:
     # IO/MutationObserver는 하강 시작 전에 주입(두 모드 공통으로 메타를 최대한 확보)
     bootstrap_observers()
 
+    if mode == "VIDEO_META_REPAIR":
+        repair_video_items_meta(BOOKMARK_META_LOCAL_ITEMS_PATH)
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        print("message: VIDEO_META_REPAIR completed.")
+        sys.exit(0)
+
     # === MOD: 하강 시작 전에 top jiggle 1회로 초기 로딩 유도
     pre_descent_jiggle(set(), {})  # 초기 CDP 누계 의미 없으므로 더미로 호출, 메시지 용도
 
     # 1) 완전 하강 (도중에 주기적으로 CDP/IO drain 및 로그)
     cdp_seen_keys: set[str] = set()
     cdp_url_by_key: Dict[str, str] = {}
+    cdp_meta_by_key: Dict[str, Dict[str, str]] = {}
     desc_meta_by_key: Dict[str, Dict[str, str]] = {}  # 하강 중 IO로 모은 메타(키 -> 메타)
     already_saved_keys = load_seen_media_keys_from_local(BOOKMARK_META_LOCAL_ITEMS_PATH)
     print(f"message: backup_mode={backup_mode}, loaded existing local keys={len(already_saved_keys)}")
     stop_keys = already_saved_keys if backup_mode == "PERIODIC" else None
-    cdp_peak = full_descent(cdp_seen_keys, cdp_url_by_key, desc_meta_by_key, stop_when_seen_keys=stop_keys)
+    cdp_peak = full_descent(
+        cdp_seen_keys,
+        cdp_url_by_key,
+        desc_meta_by_key,
+        stop_when_seen_keys=stop_keys,
+        cdp_meta_by_key=cdp_meta_by_key,
+    )
 
     # 2) 하강 직후 CDP를 한 번 더 drain -> 타겟 최종 확정
-    _ = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
+    _ = update_cdp_seen_from_logs_with_keys(cdp_seen_keys, cdp_url_by_key, cdp_meta_by_key=cdp_meta_by_key)
     target_url_by_key: Dict[str, str] = dict(cdp_url_by_key)  # key -> canonical URL
     target_keys = set(target_url_by_key.keys())
     TargetTotalSeen = len(target_keys)
@@ -1884,52 +4453,116 @@ else:
             print(f"message: CDP_ONLY target too low (Target={TargetTotalSeen} < MinAllowed={min_allowed}). Auto-fallback to SAFE.")
             mode = "SAFE"
 
-    # 3) 수집/다운로드 엔트리 구성
-    missing_keys: List[str] = []  # SAFE에서만 의미 있음
+    # 3) 수집/다운로드 엔트리 구성 (IMAGE_ONLY / ALL 분기)
+    run_image_keys: set[str] = set()
+    run_video_keys: set[str] = set()
+    for k in run_target_keys:
+        u = target_url_by_key.get(k, "") or ""
+        if (media_mode == "ALL") and is_video_url(u):
+            run_video_keys.add(k)
+        else:
+            run_image_keys.add(k)
+    print(f"message: media_mode={media_mode}, imageTargets={len(run_image_keys)}, videoTargets={len(run_video_keys)}")
+
+    all_entries: List[Dict[str, str]] = []
+
+    # 이미지 경로: 기존 로직 그대로
+    missing_keys: List[str] = []
     if mode == "CDP_ONLY":
-        # 업스크롤 없이 즉시 다운로드
-        # 하강 중 IO에서 모아둔 메타(desc_meta_by_key)가 있으면 반영
-        for k in run_target_keys:
-            meta = desc_meta_by_key.get(k, {"uploader_name": "", "upload_time": "", "tweet_id": ""})
-            image_entries.append({
+        for k in run_image_keys:
+            meta = pick_better_meta(
+                desc_meta_by_key.get(k, {"uploader_name": "", "upload_time": "", "tweet_id": ""}),
+                cdp_meta_by_key.get(k, {"uploader_name": "", "upload_time": "", "tweet_id": ""}),
+            )
+            all_entries.append({
                 "url": target_url_by_key[k],
                 "uploader_name": meta.get("uploader_name", ""),
                 "upload_time": meta.get("upload_time", ""),
                 "tweet_id": meta.get("tweet_id", ""),
             })
     else:
-        # SAFE 모드: 업스크롤 수집/매칭
-        confirmed_map = {}
-        confirmed_keys = set()
-        if run_target_keys:
-            confirmed_map, confirmed_keys, missing_keys = safe_upward_collect(run_target_keys, target_url_by_key)
-        else:
-            missing_keys = []
-        # 엔트리 구성: 확정된 것은 confirmed_map 메타, 미싱은 하강-IO 메타로 보강(없으면 빈값)
-        for k in run_target_keys:
-            if k in confirmed_map:
-                image_entries.append({
-                    "url": confirmed_map[k]["url"],
-                    "uploader_name": confirmed_map[k]["uploader_name"],
-                    "upload_time": confirmed_map[k]["upload_time"],
-                    "tweet_id": confirmed_map[k].get("tweet_id", ""),
+        confirmed_map_img = {}
+        confirmed_keys_img = set()
+        if run_image_keys:
+            confirmed_map_img, confirmed_keys_img, missing_keys = safe_upward_collect(
+                run_image_keys,
+                {k: target_url_by_key[k] for k in run_image_keys},
+                cdp_seen_keys_ref=cdp_seen_keys,
+                cdp_url_by_key_ref=cdp_url_by_key,
+                cdp_meta_by_key_ref=cdp_meta_by_key,
+            )
+        for k in run_image_keys:
+            if k in confirmed_map_img:
+                best_meta = pick_better_meta(
+                    confirmed_map_img[k],
+                    cdp_meta_by_key.get(k, {"uploader_name": "", "upload_time": "", "tweet_id": ""}),
+                )
+                all_entries.append({
+                    "url": confirmed_map_img[k]["url"],
+                    "uploader_name": best_meta.get("uploader_name", ""),
+                    "upload_time": best_meta.get("upload_time", ""),
+                    "tweet_id": best_meta.get("tweet_id", ""),
                 })
             else:
-                fallback_meta = desc_meta_by_key.get(k, {"uploader_name": "", "upload_time": "", "tweet_id": ""})
-                image_entries.append({
+                fallback_meta = pick_better_meta(
+                    desc_meta_by_key.get(k, {"uploader_name": "", "upload_time": "", "tweet_id": ""}),
+                    cdp_meta_by_key.get(k, {"uploader_name": "", "upload_time": "", "tweet_id": ""}),
+                )
+                all_entries.append({
                     "url": target_url_by_key[k],
                     "uploader_name": fallback_meta.get("uploader_name", ""),
                     "upload_time": fallback_meta.get("upload_time", ""),
                     "tweet_id": fallback_meta.get("tweet_id", ""),
                 })
 
-    # 3.5) local 메타 누적 저장(bookmark_meta_local/items.ndjson)
-    local_added, local_total = append_local_items_ndjson(BOOKMARK_META_LOCAL_ITEMS_PATH, image_entries)
+    # ALL 모드일 때만 비디오 보강 파이프라인 수행
+    if media_mode == "ALL" and run_video_keys:
+        gql_updates = backfill_tweet_id_from_graphql_bodies(cdp_meta_by_key)
+        print(f"message: ALL video meta pass targets={len(run_video_keys)}, gqlBackfill={gql_updates}")
+        video_entries: List[Dict[str, str]] = []
+        for k in run_video_keys:
+            cdp_meta_k, cdp_meta_key = _lookup_meta_by_video_key_alias(k, cdp_meta_by_key)
+            tid_src = _source_for_video_key_alias(k, cdp_meta_key)
+            tid_conf = _tid_confidence(tid_src)
+            meta = pick_better_meta(
+                desc_meta_by_key.get(k, {"uploader_name": "", "upload_time": "", "tweet_id": ""}),
+                cdp_meta_k or {"uploader_name": "", "upload_time": "", "tweet_id": ""},
+            )
+            video_entries.append({
+                "url": target_url_by_key[k],
+                "uploader_name": meta.get("uploader_name", ""),
+                "upload_time": meta.get("upload_time", ""),
+                "tweet_id": meta.get("tweet_id", ""),
+                "tid_source": tid_src,
+                "tid_confidence": tid_conf,
+            })
+        missing_author_video = sum(1 for v in video_entries if (v.get("tweet_id") or "").strip().isdigit() and not (v.get("uploader_name") or "").strip())
+        print(f"message: ALL video pre-repair summary missingAuthorVideo={missing_author_video}/{len(video_entries)}")
+        all_entries.extend(video_entries)
+
+    enrich_updated = enrich_entries_with_dom_meta(all_entries)
+    print(f"message: pre-save meta enrich updated={enrich_updated}")
+
+    # 3.5) local 메타 누적 저장(bookmark_meta_local/items.ndjson) - 이미지/동영상 통합
+    local_added, local_total = append_local_items_ndjson(BOOKMARK_META_LOCAL_ITEMS_PATH, all_entries)
     print(f"message: local ndjson appended={local_added}, total={local_total}, path={BOOKMARK_META_LOCAL_ITEMS_PATH}")
+
+    # 3.6) 다운로드 전에 같은 세션에서 즉시 repair 수행 여부 선택 (ALL 모드만)
+    if media_mode == "ALL":
+        if ask_repair_now():
+            repair_video_items_meta(
+                BOOKMARK_META_LOCAL_ITEMS_PATH,
+                preloaded_timeline=True,
+                preloaded_cdp_seen_keys=cdp_seen_keys,
+                preloaded_cdp_url_by_key=cdp_url_by_key,
+                preloaded_cdp_meta_by_key=cdp_meta_by_key,
+            )
+        else:
+            print("message: repair skipped by user choice.")
 
     # 4) 수집 완료 후 다운로드 여부 선택
     if ask_download_now():
-        _ = run_download(image_entries, new_folder_path)
+        _ = run_download(all_entries, new_folder_path)
     else:
         print("message: download skipped by user choice. exiting.")
 

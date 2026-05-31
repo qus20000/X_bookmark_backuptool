@@ -1,6 +1,14 @@
 ﻿$ErrorActionPreference = "Stop"
 Set-Location -Path $PSScriptRoot
 
+$ffmpegBin = Join-Path $PSScriptRoot ".venv\tools\ffmpeg\bin"
+if (Test-Path (Join-Path $ffmpegBin "ffmpeg.exe")) {
+    $env:Path = "$ffmpegBin;$env:Path"
+    Write-Host "[INFO] ffmpeg path added: $ffmpegBin"
+} else {
+    Write-Host "[WARN] ffmpeg.exe not found at $ffmpegBin"
+}
+
 $debugPort = 9222
 $chromeCandidates = @(
     "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
@@ -35,5 +43,3 @@ Write-Host "[INFO] Running X_bookmark_backuptool.py..."
 
 Write-Host ""
 Read-Host "[INFO] Finished. Press Enter to close"
-
-
