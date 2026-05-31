@@ -338,7 +338,9 @@ def _quick_resolve_best_video_url(url: str) -> str:
     if "/aud/" in u:
         return u
     if u.endswith(".m3u8") or ".m3u8?" in u:
-        return _quick_pick_best_variant_from_m3u8(u)
+        # Keep the master playlist for ffmpeg. Selecting a video-only variant here
+        # can drop X's separate audio rendition.
+        return u
     return u
 
 def _quick_ffmpeg_path() -> str:
@@ -365,6 +367,10 @@ def _quick_download_hls_to_mp4(m3u8_url: str, out_path_mp4: str) -> Tuple[bool, 
         "error",
         "-i",
         m3u8_url,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
         "-c",
         "copy",
         "-movflags",
@@ -1454,8 +1460,9 @@ def resolve_best_video_url(url: str, session: requests.Session) -> str:
     if "/aud/" in u:
         return u
     if u.endswith(".m3u8") or ".m3u8?" in u:
-        # master -> best variant. If variant still m3u8, keep it as is.
-        return _pick_best_variant_from_m3u8(u, session)
+        # Keep the master playlist for ffmpeg. Selecting a video-only variant here
+        # can drop X's separate audio rendition.
+        return u
     return u
 
 def _download_hls_to_mp4(m3u8_url: str, out_path_mp4: str) -> Tuple[bool, str | None]:
@@ -1480,6 +1487,10 @@ def _download_hls_to_mp4(m3u8_url: str, out_path_mp4: str) -> Tuple[bool, str | 
         "error",
         "-i",
         m3u8_url,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
         "-c",
         "copy",
         "-movflags",
