@@ -3182,6 +3182,22 @@ def _descent_rescue_probe(
     progressed = (h1 > h0 + 8) or (y1 > y0 + 8) or (k1 > k0)
     return progressed, y1, h1, k1 - k0
 
+def ask_scroll_ended_confirm(stop_reason: str, y: int, h: int, cdp_count: int) -> bool:
+    print("\n============================================================")
+    print(f"Scroll appears stalled: {stop_reason}")
+    print(f"  yOffset={y}, scrollHeight={h}, cdpKeys={cdp_count}")
+    print("Has the timeline really ended?")
+    print("  Y) Yes, continue to next step")
+    print("  N) No, try to keep scrolling")
+    print("============================================================")
+    print("Press 'Y' or 'N'...")
+    while True:
+        ch = msvcrt.getwch()
+        if ch in ("y", "Y"):
+            return True
+        if ch in ("n", "N"):
+            return False
+
 def _dynamic_upward_scan_limit(start_y: int, step: int, rounds: int = 0, margin_steps: int = 80) -> int:
     """
     Safety cap for bottom-to-top repair scans.
@@ -3358,55 +3374,47 @@ def full_descent(cdp_seen_keys: set[str], cdp_url_by_key: Dict[str, str],
             }, refresh=False)
 
             if stall_cycles >= DOWN_STALL_TOLERANCE:
-                if rescue_attempts < max_rescue_attempts and (
-                    FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL <= 0
-                    or len(cdp_seen_keys) < FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL
-                ):
-                    rescue_attempts += 1
-                    progressed, ry, rh, rk = _descent_rescue_probe(
-                        cdp_seen_keys,
-                        cdp_url_by_key,
-                        cdp_meta_by_key=cdp_meta_by_key,
-                    )
-                    print(
-                        f"message: descent rescue {rescue_attempts}/{max_rescue_attempts} "
-                        f"progress={int(progressed)}, y={ry}, h={rh}, cdpNew={rk}, "
-                        f"cdp={len(cdp_seen_keys)}/{FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL or '-'}"
-                    )
-                    if progressed:
-                        prev_h = max(prev_h, rh)
-                        last_y = ry
-                        stall_cycles = 0
-                        y_stall_seq = 0
-                        cdp_peak = max(cdp_peak, len(cdp_seen_keys))
-                        continue
                 stop_reason = f"height-stall x{stall_cycles}"
-                break
+                if ask_scroll_ended_confirm(stop_reason, _get_scroll_y(), _get_scroll_h(), len(cdp_seen_keys)):
+                    break
+                rescue_attempts += 1
+                progressed, ry, rh, rk = _descent_rescue_probe(
+                    cdp_seen_keys,
+                    cdp_url_by_key,
+                    cdp_meta_by_key=cdp_meta_by_key,
+                )
+                print(
+                    f"message: descent continue requested. rescue={rescue_attempts}/{max_rescue_attempts} "
+                    f"progress={int(progressed)}, y={ry}, h={rh}, cdpNew={rk}, "
+                    f"cdp={len(cdp_seen_keys)}/{FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL or '-'}"
+                )
+                prev_h = max(prev_h, rh)
+                last_y = ry
+                stall_cycles = 0
+                y_stall_seq = 0
+                cdp_peak = max(cdp_peak, len(cdp_seen_keys))
+                continue
             if y_stall_seq >= YOFFSET_STALL_BURSTS:
-                if rescue_attempts < max_rescue_attempts and (
-                    FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL <= 0
-                    or len(cdp_seen_keys) < FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL
-                ):
-                    rescue_attempts += 1
-                    progressed, ry, rh, rk = _descent_rescue_probe(
-                        cdp_seen_keys,
-                        cdp_url_by_key,
-                        cdp_meta_by_key=cdp_meta_by_key,
-                    )
-                    print(
-                        f"message: descent rescue {rescue_attempts}/{max_rescue_attempts} "
-                        f"progress={int(progressed)}, y={ry}, h={rh}, cdpNew={rk}, "
-                        f"cdp={len(cdp_seen_keys)}/{FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL or '-'}"
-                    )
-                    if progressed:
-                        prev_h = max(prev_h, rh)
-                        last_y = ry
-                        stall_cycles = 0
-                        y_stall_seq = 0
-                        cdp_peak = max(cdp_peak, len(cdp_seen_keys))
-                        continue
                 stop_reason = f"yoffset-stall x{y_stall_seq}"
-                break
+                if ask_scroll_ended_confirm(stop_reason, _get_scroll_y(), _get_scroll_h(), len(cdp_seen_keys)):
+                    break
+                rescue_attempts += 1
+                progressed, ry, rh, rk = _descent_rescue_probe(
+                    cdp_seen_keys,
+                    cdp_url_by_key,
+                    cdp_meta_by_key=cdp_meta_by_key,
+                )
+                print(
+                    f"message: descent continue requested. rescue={rescue_attempts}/{max_rescue_attempts} "
+                    f"progress={int(progressed)}, y={ry}, h={rh}, cdpNew={rk}, "
+                    f"cdp={len(cdp_seen_keys)}/{FULL_DESCENT_MIN_CDP_KEYS_BEFORE_STALL or '-'}"
+                )
+                prev_h = max(prev_h, rh)
+                last_y = ry
+                stall_cycles = 0
+                y_stall_seq = 0
+                cdp_peak = max(cdp_peak, len(cdp_seen_keys))
+                continue
 
     # 최종 drain(마지막 남은 이벤트/버퍼 수거)
     _ = update_cdp_seen_from_logs(cdp_seen_keys, cdp_url_by_key)
