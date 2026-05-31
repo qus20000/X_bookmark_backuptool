@@ -214,9 +214,11 @@ bookmark_meta/
 downloaded_images/
 bookmark_meta_local/
 downloaded_images_local/
+downloaded_images_local*/
 bookmark_meta_oldver/
 downloaded_images_oldver/
 downloaded_images_oldvera/
+downloaded_images_oldver*/
 x_oauth_token.json
 
 # Downloaded image files (root-based + extension rules)
